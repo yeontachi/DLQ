@@ -1,0 +1,20 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug CUDA app (gdb)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/app",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [
+        { "name": "CUDA_LAUNCH_BLOCKING", "value": "1" }
+      ],
+      "MIMode": "gdb",
+      "externalConsole": false,
+      "preLaunchTask": "build-cuda"
+    }
+  ]
+}

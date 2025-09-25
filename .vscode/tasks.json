@@ -1,0 +1,21 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build-cuda",
+      "type": "shell",
+      "command": "/usr/local/cuda/bin/nvcc",
+      "args": [
+        "main.cu",
+        "-o", "build/app",
+        "-O2",
+        "-std=c++17",
+        "-lcudart",
+        "--compiler-options", "-fPIC"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$gcc"]
+    }
+  ]
+}
