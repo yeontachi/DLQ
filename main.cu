@@ -12,7 +12,7 @@ int main() {
     if (err != cudaSuccess) { printf("cudaMalloc error: %s\n", cudaGetErrorString(err)); return 1; }
 
     cudaMemcpy(d, &h, sizeof(int), cudaMemcpyHostToDevice);
-    add1<<<1,1>>>(d);
+    add1<<<1,10>>>(d);
     err = cudaDeviceSynchronize();
     if (err != cudaSuccess) { printf("kernel error: %s\n", cudaGetErrorString(err)); return 1; }
 
