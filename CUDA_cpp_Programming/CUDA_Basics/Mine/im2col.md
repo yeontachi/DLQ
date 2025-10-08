@@ -16,3 +16,8 @@ row-major?
 
 
 https://teach-meaning.tistory.com/1294 thread block grid
+
+
+im2col.cu에서 N=1가정했는데 
+N이 정확히 뭐고?
+N을 키우면 어떤 일이 발생하는가?
