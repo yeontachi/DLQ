@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BUILD=build/step2_conv1_bn1_relu   # ← bn1로 수정
+BUILD=build/fp32/step2_conv1_bn1_relu   # ← 여기 수정
 MANI=exports/resnet18/fp32
 
-# 존재 확인
 if [[ ! -x "$BUILD" ]]; then
   echo "Error: $BUILD not found or not executable. Did you build?"
   echo "Try: bash scripts/build_fp32.sh"
