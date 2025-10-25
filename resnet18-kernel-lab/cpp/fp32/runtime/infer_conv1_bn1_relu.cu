@@ -5,10 +5,14 @@
 #include "utils.hpp"
 
 // 커널 선언
-extern "C" void im2col_nchw(const float*,int,int,int,int,int,int,int,int,int,int,float*);
-extern "C" void sgemm_tiled(const float*,const float*,float*,int,int,int);
-extern "C" void bn_inference(float*,const float*,const float*,const float*,const float*,float,int,int,int);
-extern "C" void relu_forward(float*,int);
+extern "C" __global__
+void im2col_nchw(const float*,int,int,int,int,int,int,int,int,int,int,float*);
+extern "C" __global__
+void sgemm_tiled(const float*,const float*,float*,int,int,int);
+extern "C" __global__
+void bn_inference(float*,const float*,const float*,const float*,const float*,float,int,int,int);
+extern "C" __global__
+void relu_forward(float*,int);
 
 // 간단 파라미터 (ResNet18 conv1 설정)
 struct Conv1Cfg {
