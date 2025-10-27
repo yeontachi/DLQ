@@ -474,6 +474,22 @@ int main(int argc, char** argv){
         ms_pool = T.stop();
     }
 
+    // 디버그: stem after maxpool (shape [1,64,56,56])
+    {
+        std::vector<float> stem_after_pool(pool_out_elems);
+        CUDA_CHECK(cudaMemcpy(
+            stem_after_pool.data(),
+            dPoolOut,
+            pool_out_elems * sizeof(float),
+            cudaMemcpyDeviceToHost
+        ));
+
+        // 임시로 파일로 떨어뜨리자
+        FILE* f = fopen("debug_stem_after_pool.bin", "wb");
+        fwrite(stem_after_pool.data(), sizeof(float), stem_after_pool.size(), f);
+        fclose(f);
+    }
+
     // ----------------------------------------------------------------
     // 7) BasicBlock layer1[0]
     {
