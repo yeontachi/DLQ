@@ -1,408 +1,573 @@
-// cpp/fp32/runtime/infer_stem_block0.cpp
+/*
+infer_stem_block0.cu
+
+Step3 runner:
+    1) conv1 -> bn1 -> relu
+    2) maxpool (3x3, stride=2, pad=1)
+    3) basic_block (layer1[0], identity skip)
+    4) compare against PyTorch dump (sample_block0_out.bin)
+
+Inputs:
+    --manifest <dir>   exports/resnet18/fp32
+    --input    <bin>   sample_input.bin          # N=1,C=3,H=224,W=224
+    --expect   <bin>   sample_block0_out.bin     # after stem+block0
+
+Assumptions:
+    - N=1 always
+    - conv1: 7x7, stride=2, pad=3, inC=3, outC=64
+    - maxpool: 3x3, stride=2, pad=1
+    - basic_block: C=64, H=W=56, identity skip (layer1[0])
+*/
 
 #include <iostream>
 #include <vector>
 #include <string>
 #include <cmath>
+#include <cuda_runtime.h>
 #include "utils.hpp"
 
-// Step2 커널들
-extern "C" __global__
-void im2col_nchw(const float*,int,int,int,int,int,int,int,int,int,int,float*);
-extern "C" __global__
-void sgemm_tiled(const float*,const float*,float*,int,int,int);
-extern "C" __global__
-void bn_inference(float*,const float*,const float*,const float*,const float*,float,int,int,int);
-extern "C" __global__
-void relu_forward(float*,int);
+// ===== device kernels (must match definitions in kernels/*.cu) =====
 
-// Step3 커널들
+extern "C" __global__
+void im2col_nchw(const float* x,
+                 int N,int C,int H,int W,
+                 int kH,int kW,
+                 int sH,int sW,
+                 int pH,int pW,
+                 float* col);
+
+extern "C" __global__
+void sgemm_tiled(const float* A,
+                 const float* B,
+                 float* C,
+                 int M, int N_, int K);
+
+extern "C" __global__
+void bn_inference(float* x,
+                  const float* gamma,
+                  const float* beta,
+                  const float* mean,
+                  const float* var,
+                  float eps,
+                  int C, int H, int W);
+
+extern "C" __global__
+void relu_forward(float* x,
+                  int total);
+
 extern "C" __global__
 void maxpool2d_kernel_fp32(
-    const float*, float*,
-    int,int,int,int,
-    int,int,int,int,int,int,int,int);
+    const float* in,
+    float* out,
+    int N, int C, int H, int W,
+    int kernel_h, int kernel_w,
+    int stride_h, int stride_w,
+    int pad_h, int pad_w,
+    int H_out, int W_out);
+
+extern "C" __global__
+void tensor_add_fp32_kernel(const float* a,
+                            const float* b,
+                            float* out,
+                            int total);
+
+// ===== basic block host API (from kernels/basic_block.cu) =====
 extern "C"
 void basic_block_fp32_forward_identity(
-    const float* d_x,
-    float* d_out,
-    float* d_tmp1,
-    float* d_tmp2,
-    float* d_colBuf,
-    const float* d_w1col,
-    int N, int C, int H, int W,
-    int C1out,
-    int k1H,int k1W,
-    int s1H,int s1W,
-    int p1H,int p1W,
+    const float* d_x,        // input / identity skip
+    float* d_out,            // final output
+    float* d_tmp1,           // scratch after conv1/bn/relu
+    float* d_tmp2,           // scratch after conv2/bn
+    float* d_colBuf,         // workspace
+
+    const float* d_w1col,    // conv1 weights flattened
     const float* d_bn1_gamma,
     const float* d_bn1_beta,
     const float* d_bn1_mean,
     const float* d_bn1_var,
     float bn1_eps,
-    const float* d_w2col,
-    int C2out,
-    int k2H,int k2W,
-    int s2H,int s2W,
-    int p2H,int p2W,
+
+    const float* d_w2col,    // conv2 weights flattened
     const float* d_bn2_gamma,
     const float* d_bn2_beta,
     const float* d_bn2_mean,
     const float* d_bn2_var,
     float bn2_eps,
+
+    int N, int C, int H, int W,
+
     cudaStream_t stream
 );
 
-// Timer는 Step2에서 사용한 동일 구조라고 가정
-static void usage(){
-    std::cout<<"--manifest exports/resnet18/fp32 --input input.bin --expect_block0 block0_out.bin\n";
+// ---------------------------------------------------------------
+// stem config for conv1/bn1/relu
+struct StemCfg {
+    // input  : [N=1, C=3, H=224, W=224]
+    // conv1  : 7x7 stride2 pad3, outC=64
+    // output : [1, 64, 112, 112]
+    int N = 1;
+    int C = 3;
+    int H = 224;
+    int W = 224;
+
+    int OC = 64;
+    int KH = 7;
+    int KW = 7;
+    int SH = 2;
+    int SW = 2;
+    int PH = 3;
+    int PW = 3;
+
+    int OH = (H + 2*PH - KH)/SH + 1; // 112
+    int OW = (W + 2*PW - KW)/SW + 1; // 112
+
+    // im2col dims
+    int KCOL = C * KH * KW;   // rows per output pixel
+    int NCOL = OH * OW;       // number of output pixels (N=1 assumed)
+};
+
+// after maxpool(3x3,s2,p1):
+// shape -> [1, 64, 56, 56]
+struct PoolCfg {
+    int N = 1;
+    int C = 64;
+    int H_in = 112;
+    int W_in = 112;
+
+    int KH = 3;
+    int KW = 3;
+    int SH = 2;
+    int SW = 2;
+    int PH = 1;
+    int PW = 1;
+
+    int H_out = (H_in + 2*PH - KH)/SH + 1; // 56
+    int W_out = (W_in + 2*PW - KW)/SW + 1; // 56
+};
+
+// basic block cfg for layer1[0]:
+// keeps C=64, spatial 56x56
+struct Block0Cfg {
+    int N = 1;
+    int C = 64;
+    int H = 56;
+    int W = 56;
+
+    // convs in block0 are 3x3 stride1 pad1, so spatial unchanged
+    int KH = 3;
+    int KW = 3;
+    int SH = 1;
+    int SW = 1;
+    int PH = 1;
+    int PW = 1;
+
+    int OH = 56;
+    int OW = 56;
+
+    int KCOL = C * KH * KW;    // 64 * 3 * 3 = 576
+    int NCOL = OH * OW;        // 3136
+};
+
+// ----------------------------------------------------------------
+// helper: flatten OIHW weight (OC,IC,KH,KW) -> [OC, IC*KH*KW]
+static void flatten_OIHW_to_OxKCOL(
+    const std::vector<float> &w, // size OC*IC*KH*KW
+    int OC, int IC, int KH, int KW,
+    std::vector<float> &Wcol    // size OC * (IC*KH*KW)
+){
+    int KCOL = IC * KH * KW;
+    Wcol.resize(OC * KCOL);
+    for (int o=0;o<OC;o++){
+        for (int c=0;c<IC;c++){
+            for (int kh=0;kh<KH;kh++){
+                for (int kw=0;kw<KW;kw++){
+                    int r   = c*KH*KW + kh*KW + kw; // row idx within KCOL
+                    int src = o*IC*KH*KW + c*KH*KW + kh*KW + kw;
+                    Wcol[o*KCOL + r] = w[src];
+                }
+            }
+        }
+    }
 }
 
+// usage info
+static void usage(){
+    std::cout
+        << "--manifest exports/resnet18/fp32 "
+        << "--input exports/resnet18/fp32/sample_input.bin "
+        << "--expect exports/resnet18/fp32/sample_block0_out.bin\n";
+}
+
+// ===============================================================
+
 int main(int argc, char** argv){
-    std::string mani, inputPath, expectPath;
+    std::string maniDir;
+    std::string inputPath;
+    std::string expectPath;
+
+    // parse CLI
     for (int i=1;i<argc;i++){
-        std::string a=argv[i];
-        if (a=="--manifest" && i+1<argc) mani=argv[++i];
-        else if (a=="--input" && i+1<argc) inputPath=argv[++i];
-        else if (a=="--expect" && i+1<argc) expectPath=argv[++i];
-    }
-    if (mani.empty()||inputPath.empty()||expectPath.empty()){ usage(); return 1; }
-
-    // --------------------------
-    // 1. shape 정의
-    // --------------------------
-    // stem input
-    int N=1, C_in=3, H_in=224, W_in=224;
-
-    // conv1 (7x7 s2 p3) -> (1,64,112,112)
-    int C1_out=64, k1H=7,k1W=7, s1H=2,s1W=2, p1H=3,p1W=3;
-    int H1 = (H_in+2*p1H-k1H)/s1H + 1; //112
-    int W1 = (W_in+2*p1W-k1W)/s1W + 1; //112
-
-    // maxpool (3x3 s2 p1) -> (1,64,56,56)
-    int poolKH=3,poolKW=3;
-    int poolSH=2,poolSW=2;
-    int poolPH=1,poolPW=1;
-    int H2 = (H1+2*poolPH-poolKH)/poolSH + 1; //56
-    int W2 = (W1+2*poolPW-poolKW)/poolSW + 1; //56
-
-    // block0 (3x3 s1 p1 twice, C stays 64)
-    int blk_kH=3, blk_kW=3;
-    int blk_sH=1, blk_sW=1;
-    int blk_pH=1, blk_pW=1;
-    int Cblk = 64; // stays 64, output shape (1,64,56,56)
-
-    // --------------------------
-    // 2. 호스트에서 파라미터/입력 로드
-    // --------------------------
-    // conv1 weights: conv1.weight.bin -> [64,3,7,7]
-    // reshape to Wcol: [64, 3*7*7]
-    // bn1 params: bn1.weight.bin, bn1.bias.bin, bn1.running_mean.bin, bn1.running_var.bin
-    //
-    // block0 conv1,conv2 weights:
-    //   layer1.0.conv1.weight.bin → [64,64,3,3] -> flatten to [64, 64*3*3]
-    //   layer1.0.conv2.weight.bin → same
-    // block0 bn params:
-    //   layer1.0.bn1.(weight,bias,mean,var).bin
-    //   layer1.0.bn2.(weight,bias,mean,var).bin
-    //
-    // expectPath = block0 output reference from PyTorch after stem+block0.
-    //
-    auto x_input = load_bin_f32(inputPath,  N*C_in*H_in*W_in);
-
-    // stem conv1/bn1 params
-    auto w_conv1 = load_bin_f32(mani+"/conv1.weight.bin", C1_out*C_in*k1H*k1W);
-    auto bn1_w   = load_bin_f32(mani+"/bn1.weight.bin",   C1_out);
-    auto bn1_b   = load_bin_f32(mani+"/bn1.bias.bin",     C1_out);
-    auto bn1_m   = load_bin_f32(mani+"/bn1.running_mean.bin", C1_out);
-    auto bn1_v   = load_bin_f32(mani+"/bn1.running_var.bin",  C1_out);
-
-    // block0 conv/bn params
-    auto w_blk1  = load_bin_f32(mani+"/layer1.0.conv1.weight.bin", Cblk*Cblk*blk_kH*blk_kW);
-    auto w_blk2  = load_bin_f32(mani+"/layer1.0.conv2.weight.bin", Cblk*Cblk*blk_kH*blk_kW);
-
-    auto blk1_w  = load_bin_f32(mani+"/layer1.0.bn1.weight.bin", Cblk);
-    auto blk1_b  = load_bin_f32(mani+"/layer1.0.bn1.bias.bin",   Cblk);
-    auto blk1_m  = load_bin_f32(mani+"/layer1.0.bn1.running_mean.bin", Cblk);
-    auto blk1_v  = load_bin_f32(mani+"/layer1.0.bn1.running_var.bin",  Cblk);
-
-    auto blk2_w  = load_bin_f32(mani+"/layer1.0.bn2.weight.bin", Cblk);
-    auto blk2_b  = load_bin_f32(mani+"/layer1.0.bn2.bias.bin",   Cblk);
-    auto blk2_m  = load_bin_f32(mani+"/layer1.0.bn2.running_mean.bin", Cblk);
-    auto blk2_v  = load_bin_f32(mani+"/layer1.0.bn2.running_var.bin",  Cblk);
-
-    auto y_expect = load_bin_f32(expectPath, N*Cblk*H2*W2); // torch ref after block0
-
-    // conv1 weight -> Wcol(flat)
-    std::vector<float> Wcol_conv1(C1_out * (C_in*k1H*k1W));
-    {
-        for (int oc=0; oc<C1_out; ++oc){
-            for (int ic=0; ic<C_in; ++ic){
-                for (int kh=0; kh<k1H; ++kh){
-                    for (int kw=0; kw<k1W; ++kw){
-                        int r   = ic*k1H*k1W + kh*k1W + kw; // row idx in KCOL
-                        int src = oc*C_in*k1H*k1W + ic*k1H*k1W + kh*k1W + kw;
-                        Wcol_conv1[oc*(C_in*k1H*k1W) + r] = w_conv1[src];
-                    }
-                }
-            }
+        std::string a = argv[i];
+        if (a=="--manifest" && i+1<argc) {
+            maniDir = argv[++i];
+        } else if (a=="--input" && i+1<argc) {
+            inputPath = argv[++i];
+        } else if (a=="--expect" && i+1<argc) {
+            expectPath = argv[++i];
         }
     }
-
-    // block0 conv1 weight -> flatten [64, 64*3*3]
-    std::vector<float> Wcol_blk1(Cblk * (Cblk*blk_kH*blk_kW));
-    {
-        for (int oc=0; oc<Cblk; ++oc){
-            for (int ic=0; ic<Cblk; ++ic){
-                for (int kh=0; kh<blk_kH; ++kh){
-                    for (int kw=0; kw<blk_kW; ++kw){
-                        int r   = ic*blk_kH*blk_kW + kh*blk_kW + kw;
-                        int src = oc*Cblk*blk_kH*blk_kW + ic*blk_kH*blk_kW + kh*blk_kW + kw;
-                        Wcol_blk1[oc*(Cblk*blk_kH*blk_kW) + r] = w_blk1[src];
-                    }
-                }
-            }
-        }
+    if (maniDir.empty()||inputPath.empty()||expectPath.empty()){
+        usage(); return 1;
     }
 
-    // block0 conv2 weight -> flatten
-    std::vector<float> Wcol_blk2 = Wcol_blk1; // if conv2 has same shape as conv1
-    // 만약 layer1.0.conv2.weight.bin이 다르면 위랑 똑같이 변환해서 Wcol_blk2 채우면 됨.
-    {
-        for (int oc=0; oc<Cblk; ++oc){
-            for (int ic=0; ic<Cblk; ++ic){
-                for (int kh=0; kh<blk_kH; ++kh){
-                    for (int kw=0; kw<blk_kW; ++kw){
-                        int r   = ic*blk_kH*blk_kW + kh*blk_kW + kw;
-                        int src = oc*Cblk*blk_kH*blk_kW + ic*blk_kH*blk_kW + kh*blk_kW + kw;
-                        Wcol_blk2[oc*(Cblk*blk_kH*blk_kW) + r] = w_blk2[src];
-                    }
-                }
-            }
-        }
-    }
+    StemCfg stem;
+    PoolCfg pool;
+    Block0Cfg blk0;
 
-    // --------------------------
-    // 3. 디바이스 메모리 준비
-    // --------------------------
-    float *dInput, *dCol, *dConv1Out, *dPoolOut;
-    float *dBlockOut, *dTmp1, *dTmp2;
+    // ---------------------------
+    // 1) Load weights / params from disk (host)
+    // stem conv1/bn1
+    auto conv1_w  = load_bin_f32(maniDir + "/conv1.weight.bin",
+                                 stem.OC * stem.C * stem.KH * stem.KW);
+    auto bn1_w    = load_bin_f32(maniDir + "/bn1.weight.bin", stem.OC);
+    auto bn1_b    = load_bin_f32(maniDir + "/bn1.bias.bin",   stem.OC);
+    auto bn1_m    = load_bin_f32(maniDir + "/bn1.running_mean.bin", stem.OC);
+    auto bn1_v    = load_bin_f32(maniDir + "/bn1.running_var.bin",  stem.OC);
 
-    CUDA_CHECK(cudaMalloc(&dInput,    N*C_in*H_in*W_in*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dCol,      (C_in*k1H*k1W)* (H1*W1) *sizeof(float))); // stem conv1 use
-    CUDA_CHECK(cudaMalloc(&dConv1Out, C1_out*H1*W1*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dPoolOut,  C1_out*H2*W2*sizeof(float)));
+    // first basic block (layer1.0)
+    // conv1
+    auto l10c1_w  = load_bin_f32(maniDir + "/layer1.0.conv1.weight.bin",
+                                 blk0.C * blk0.C * blk0.KH * blk0.KW);
+    auto l10bn1_w = load_bin_f32(maniDir + "/layer1.0.bn1.weight.bin", blk0.C);
+    auto l10bn1_b = load_bin_f32(maniDir + "/layer1.0.bn1.bias.bin",   blk0.C);
+    auto l10bn1_m = load_bin_f32(maniDir + "/layer1.0.bn1.running_mean.bin", blk0.C);
+    auto l10bn1_v = load_bin_f32(maniDir + "/layer1.0.bn1.running_var.bin",  blk0.C);
 
-    CUDA_CHECK(cudaMalloc(&dBlockOut, Cblk*H2*W2*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dTmp1,     Cblk*H2*W2*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dTmp2,     Cblk*H2*W2*sizeof(float)));
+    // conv2
+    auto l10c2_w  = load_bin_f32(maniDir + "/layer1.0.conv2.weight.bin",
+                                 blk0.C * blk0.C * blk0.KH * blk0.KW);
+    auto l10bn2_w = load_bin_f32(maniDir + "/layer1.0.bn2.weight.bin", blk0.C);
+    auto l10bn2_b = load_bin_f32(maniDir + "/layer1.0.bn2.bias.bin",   blk0.C);
+    auto l10bn2_m = load_bin_f32(maniDir + "/layer1.0.bn2.running_mean.bin", blk0.C);
+    auto l10bn2_v = load_bin_f32(maniDir + "/layer1.0.bn2.running_var.bin",  blk0.C);
 
-    // block col buf (for convs inside block0)
-    float *dColBlock;
-    CUDA_CHECK(cudaMalloc(&dColBlock, (Cblk*blk_kH*blk_kW)*(H2*W2)*sizeof(float)));
+    // ---------------------------
+    // 2) Load input / expected reference
+    auto x_in     = load_bin_f32(inputPath,
+                                 stem.N * stem.C * stem.H * stem.W);
+    auto y_expect = load_bin_f32(expectPath,
+                                 blk0.N * blk0.C * blk0.H * blk0.W);
 
-    float *dWconv1, *dBn1W,*dBn1B,*dBn1M,*dBn1V;
-    CUDA_CHECK(cudaMalloc(&dWconv1, Wcol_conv1.size()*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dBn1W,  C1_out*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dBn1B,  C1_out*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dBn1M,  C1_out*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dBn1V,  C1_out*sizeof(float)));
+    // ---------------------------
+    // 3) Prepare flattened weights for GEMM form
+    std::vector<float> conv1_Wcol;
+    flatten_OIHW_to_OxKCOL(conv1_w,
+                           stem.OC, stem.C,
+                           stem.KH, stem.KW,
+                           conv1_Wcol);
 
-    float *dWblk1,*dWblk2;
-    float *dBlk1W,*dBlk1B,*dBlk1M,*dBlk1V;
-    float *dBlk2W,*dBlk2B,*dBlk2M,*dBlk2V;
-    CUDA_CHECK(cudaMalloc(&dWblk1, Wcol_blk1.size()*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dWblk2, Wcol_blk2.size()*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dBlk1W, Cblk*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dBlk1B, Cblk*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dBlk1M, Cblk*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dBlk1V, Cblk*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dBlk2W, Cblk*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dBlk2B, Cblk*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dBlk2M, Cblk*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dBlk2V, Cblk*sizeof(float)));
+    std::vector<float> l10c1_Wcol;
+    flatten_OIHW_to_OxKCOL(l10c1_w,
+                           blk0.C, blk0.C,
+                           blk0.KH, blk0.KW,
+                           l10c1_Wcol);
 
-    CUDA_CHECK(cudaMemcpy(dInput,   x_input.data(), x_input.size()*sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dWconv1,  Wcol_conv1.data(), Wcol_conv1.size()*sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dBn1W,    bn1_w.data(),     C1_out*sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dBn1B,    bn1_b.data(),     C1_out*sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dBn1M,    bn1_m.data(),     C1_out*sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dBn1V,    bn1_v.data(),     C1_out*sizeof(float), cudaMemcpyHostToDevice));
+    std::vector<float> l10c2_Wcol;
+    flatten_OIHW_to_OxKCOL(l10c2_w,
+                           blk0.C, blk0.C,
+                           blk0.KH, blk0.KW,
+                           l10c2_Wcol);
 
-    CUDA_CHECK(cudaMemcpy(dWblk1,   Wcol_blk1.data(), Wcol_blk1.size()*sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dWblk2,   Wcol_blk2.data(), Wcol_blk2.size()*sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dBlk1W,   blk1_w.data(),    Cblk*sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dBlk1B,   blk1_b.data(),    Cblk*sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dBlk1M,   blk1_m.data(),    Cblk*sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dBlk1V,   blk1_v.data(),    Cblk*sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dBlk2W,   blk2_w.data(),    Cblk*sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dBlk2B,   blk2_b.data(),    Cblk*sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dBlk2M,   blk2_m.data(),    Cblk*sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dBlk2V,   blk2_v.data(),    Cblk*sizeof(float), cudaMemcpyHostToDevice));
+    // ---------------------------
+    // 4) Allocate device buffers
 
-    // --------------------------
-    // 4. 실행 + 타이밍
-    // --------------------------
+    // stem conv1 output: [1,64,112,112]
+    size_t stem_out_elems = stem.OC * stem.OH * stem.OW;
+    // after maxpool: [1,64,56,56]
+    size_t pool_out_elems = pool.N * pool.C * pool.H_out * pool.W_out;
+    // block0 final out: [1,64,56,56]
+    size_t blk0_elems     = blk0.N * blk0.C * blk0.H * blk0.W;
+
+    // im2col workspace sizes
+    size_t stem_col_elems = stem.KCOL * stem.NCOL;   // (3*7*7=147 * 112*112)
+    size_t blk0_col_elems = blk0.KCOL * blk0.NCOL;   // (64*3*3=576 * 56*56=3136)
+
+    // device ptrs
+    float *dInput      = nullptr; // original input
+    float *dCol_stem   = nullptr;
+    float *dW_stem     = nullptr;
+    float *dStemOut    = nullptr;
+    float *dPoolOut    = nullptr;
+
+    float *dBn1_w=nullptr,*dBn1_b=nullptr,*dBn1_m=nullptr,*dBn1_v=nullptr;
+
+    // block0 buffers
+    float *dCol_blk0   = nullptr;
+    float *dW_l10c1    = nullptr;
+    float *dW_l10c2    = nullptr;
+
+    float *dBlkTmp1    = nullptr; // after block conv1/bn/relu
+    float *dBlkTmp2    = nullptr; // after block conv2/bn
+    float *dBlkOut     = nullptr; // final block output
+
+    float *dBn_l10bn1_w=nullptr,*dBn_l10bn1_b=nullptr,*dBn_l10bn1_m=nullptr,*dBn_l10bn1_v=nullptr;
+    float *dBn_l10bn2_w=nullptr,*dBn_l10bn2_b=nullptr,*dBn_l10bn2_m=nullptr,*dBn_l10bn2_v=nullptr;
+
+    CUDA_CHECK(cudaMalloc(&dInput,    x_in.size()*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dCol_stem, stem_col_elems*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dW_stem,   conv1_Wcol.size()*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dStemOut,  stem_out_elems*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dPoolOut,  pool_out_elems*sizeof(float)));
+
+    CUDA_CHECK(cudaMalloc(&dBn1_w, stem.OC*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dBn1_b, stem.OC*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dBn1_m, stem.OC*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dBn1_v, stem.OC*sizeof(float)));
+
+    CUDA_CHECK(cudaMalloc(&dCol_blk0, blk0_col_elems*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dW_l10c1,  l10c1_Wcol.size()*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dW_l10c2,  l10c2_Wcol.size()*sizeof(float)));
+
+    CUDA_CHECK(cudaMalloc(&dBlkTmp1,  blk0_elems*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dBlkTmp2,  blk0_elems*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dBlkOut,   blk0_elems*sizeof(float)));
+
+    CUDA_CHECK(cudaMalloc(&dBn_l10bn1_w, blk0.C*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dBn_l10bn1_b, blk0.C*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dBn_l10bn1_m, blk0.C*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dBn_l10bn1_v, blk0.C*sizeof(float)));
+
+    CUDA_CHECK(cudaMalloc(&dBn_l10bn2_w, blk0.C*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dBn_l10bn2_b, blk0.C*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dBn_l10bn2_m, blk0.C*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dBn_l10bn2_v, blk0.C*sizeof(float)));
+
+    // copy host->device
+    CUDA_CHECK(cudaMemcpy(dInput,   x_in.data(), x_in.size()*sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dW_stem,  conv1_Wcol.data(), conv1_Wcol.size()*sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dBn1_w,   bn1_w.data(),     stem.OC*sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dBn1_b,   bn1_b.data(),     stem.OC*sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dBn1_m,   bn1_m.data(),     stem.OC*sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dBn1_v,   bn1_v.data(),     stem.OC*sizeof(float), cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaMemcpy(dW_l10c1, l10c1_Wcol.data(), l10c1_Wcol.size()*sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dW_l10c2, l10c2_Wcol.data(), l10c2_Wcol.size()*sizeof(float), cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaMemcpy(dBn_l10bn1_w, l10bn1_w.data(), blk0.C*sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dBn_l10bn1_b, l10bn1_b.data(), blk0.C*sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dBn_l10bn1_m, l10bn1_m.data(), blk0.C*sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dBn_l10bn1_v, l10bn1_v.data(), blk0.C*sizeof(float), cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaMemcpy(dBn_l10bn2_w, l10bn2_w.data(), blk0.C*sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dBn_l10bn2_b, l10bn2_b.data(), blk0.C*sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dBn_l10bn2_m, l10bn2_m.data(), blk0.C*sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dBn_l10bn2_v, l10bn2_v.data(), blk0.C*sizeof(float), cudaMemcpyHostToDevice));
+
+    // ----------------------------------------------------------------
+    // 5) Run stem: conv1 -> bn1 -> relu
     Timer T;
-    float ms_conv1, ms_bn1, ms_relu1, ms_pool, ms_block;
+    float ms_im2col, ms_gemm, ms_bn, ms_relu, ms_pool, ms_block0;
 
-    // 4-1. stem conv1 (im2col + sgemm)
+    cudaStream_t stream = nullptr; // default stream (0)
+
+    // (a) im2col for stem conv1
     {
-        int KCOL  = C_in*k1H*k1W;
-        int NCOL  = H1*W1;
-
-        dim3 blkIm2(16,16);
-        dim3 grdIm2((W1+blkIm2.x-1)/blkIm2.x,
-                    (H1+blkIm2.y-1)/blkIm2.y);
+        dim3 blk(16,16);
+        dim3 grd((stem.OW + blk.x -1)/blk.x,
+                 (stem.OH + blk.y -1)/blk.y);
 
         T.start();
-        im2col_nchw<<<grdIm2, blkIm2>>>(dInput,
-            N,C_in,H_in,W_in,
-            k1H,k1W,
-            s1H,s1W,
-            p1H,p1W,
-            dCol);
+        im2col_nchw<<<grd, blk, 0, stream>>>(
+            dInput,
+            stem.N, stem.C, stem.H, stem.W,
+            stem.KH, stem.KW,
+            stem.SH, stem.SW,
+            stem.PH, stem.PW,
+            dCol_stem
+        );
         CUDA_CHECK(cudaDeviceSynchronize());
-        ms_conv1 = T.stop();
-
-        dim3 blkG(32,32);
-        dim3 grdG((NCOL+blkG.x-1)/blkG.x,
-                  (C1_out+blkG.y-1)/blkG.y);
-
-        T.start();
-        sgemm_tiled<<<grdG, blkG>>>(dWconv1, dCol, dConv1Out,
-            C1_out, NCOL, KCOL);
-        CUDA_CHECK(cudaDeviceSynchronize());
-        ms_conv1 += T.stop(); // add GEMM time
+        ms_im2col = T.stop();
     }
 
-    // 4-2. stem bn1
+    // (b) GEMM: stem conv1
     {
-        int total_spatial = C1_out*H1*W1;
-        dim3 blkBN(256);
-        dim3 grdBN((total_spatial+blkBN.x-1)/blkBN.x);
+        dim3 blk(32,32);
+        dim3 grd((stem.NCOL + blk.x -1)/blk.x,
+                 (stem.OC   + blk.y -1)/blk.y);
 
         T.start();
-        bn_inference<<<grdBN, blkBN>>>(dConv1Out,
-            dBn1W, dBn1B, dBn1M, dBn1V,
+        sgemm_tiled<<<grd, blk, 0, stream>>>(
+            dW_stem,      // [64, 3*7*7]
+            dCol_stem,    // [3*7*7, OH*OW]
+            dStemOut,     // [64, OH*OW] -> interpreted as [1,64,OH,OW]
+            stem.OC,      // M
+            stem.NCOL,    // N_
+            stem.KCOL     // K
+        );
+        CUDA_CHECK(cudaDeviceSynchronize());
+        ms_gemm = T.stop();
+    }
+
+    // (c) BN stem
+    {
+        int OH = stem.OH;
+        int OW = stem.OW;
+        int total_spatial = stem.OC * OH * OW;
+
+        dim3 blk(256);
+        dim3 grd((total_spatial + blk.x -1)/blk.x);
+
+        T.start();
+        bn_inference<<<grd, blk, 0, stream>>>(
+            dStemOut,
+            dBn1_w,
+            dBn1_b,
+            dBn1_m,
+            dBn1_v,
             1e-5f,
-            C1_out, H1, W1);
+            stem.OC, OH, OW
+        );
         CUDA_CHECK(cudaDeviceSynchronize());
-        ms_bn1 = T.stop();
+        ms_bn = T.stop();
     }
 
-    // 4-3. stem relu1
+    // (d) ReLU stem
     {
-        int total_relu = C1_out*H1*W1;
-        dim3 blkR(256);
-        dim3 grdR((total_relu+blkR.x-1)/blkR.x);
+        int total_relu = stem.OC * stem.OH * stem.OW;
+        dim3 blk(256);
+        dim3 grd((total_relu + blk.x -1)/blk.x);
 
         T.start();
-        relu_forward<<<grdR, blkR>>>(dConv1Out, total_relu);
+        relu_forward<<<grd, blk, 0, stream>>>(
+            dStemOut,
+            total_relu
+        );
         CUDA_CHECK(cudaDeviceSynchronize());
-        ms_relu1 = T.stop();
+        ms_relu = T.stop();
     }
 
-    // 4-4. maxpool
+    // ----------------------------------------------------------------
+    // 6) MaxPool 3x3 s2 p1 -> output 56x56
     {
-        int total_pool = C1_out*H2*W2;
-        dim3 blkP(256);
-        dim3 grdP((total_pool+blkP.x-1)/blkP.x);
+        int N = pool.N;
+        int C = pool.C;
+        int H_in = pool.H_in;
+        int W_in = pool.W_in;
+        int H_out = pool.H_out;
+        int W_out = pool.W_out;
+
+        int total_pool = N*C*H_out*W_out;
+        dim3 blk(256);
+        dim3 grd((total_pool + blk.x -1)/blk.x);
 
         T.start();
-        maxpool2d_kernel_fp32<<<grdP, blkP>>>(
-            dConv1Out, dPoolOut,
-            N, C1_out, H1, W1,
-            poolKH, poolKW,
-            poolSH, poolSW,
-            poolPH, poolPW,
-            H2, W2
+        maxpool2d_kernel_fp32<<<grd, blk, 0, stream>>>(
+            dStemOut,   // in: [1,64,112,112]
+            dPoolOut,   // out:[1,64,56,56]
+            N, C, H_in, W_in,
+            pool.KH, pool.KW,
+            pool.SH, pool.SW,
+            pool.PH, pool.PW,
+            H_out, W_out
         );
         CUDA_CHECK(cudaDeviceSynchronize());
         ms_pool = T.stop();
     }
 
-    // 4-5. block0
+    // ----------------------------------------------------------------
+    // 7) BasicBlock layer1[0]
     {
+        // basic_block_fp32_forward_identity(
+        //     d_x, d_out, d_tmp1, d_tmp2, d_colBuf,
+        //     d_w1col, bn1..., d_w2col, bn2..., N,C,H,W, stream)
+
         T.start();
         basic_block_fp32_forward_identity(
-            dPoolOut,     // x
-            dBlockOut,    // out
-            dTmp1,        // tmp1
-            dTmp2,        // tmp2
-            dColBlock,    // im2col workspace for block
-
-            dWblk1,       // conv1 weights (flattened)
-            N, Cblk, H2, W2,
-            Cblk,         // conv1 outC (still 64)
-            blk_kH, blk_kW,
-            blk_sH, blk_sW,
-            blk_pH, blk_pW,
-            dBlk1W, dBlk1B, dBlk1M, dBlk1V,
+            dPoolOut,
+            dBlkOut,
+            dBlkTmp1,
+            dBlkTmp2,
+            dCol_blk0,
+            dW_l10c1,
+            dBn_l10bn1_w,
+            dBn_l10bn1_b,
+            dBn_l10bn1_m,
+            dBn_l10bn1_v,
             1e-5f,
-
-            dWblk2,       // conv2 weights
-            Cblk,         // conv2 outC
-            blk_kH, blk_kW,
-            blk_sH, blk_sW,
-            blk_pH, blk_pW,
-            dBlk2W, dBlk2B, dBlk2M, dBlk2V,
+            dW_l10c2,
+            dBn_l10bn2_w,
+            dBn_l10bn2_b,
+            dBn_l10bn2_m,
+            dBn_l10bn2_v,
             1e-5f,
-
-            0 // stream
+            blk0.N, blk0.C, blk0.H, blk0.W,
+            stream
         );
         CUDA_CHECK(cudaDeviceSynchronize());
-        ms_block = T.stop();
+        ms_block0 = T.stop();
     }
 
-    // --------------------------
-    // 5. 결과 비교
-    // --------------------------
-    std::vector<float> y_out(N*Cblk*H2*W2);
-    CUDA_CHECK(cudaMemcpy(y_out.data(), dBlockOut, y_out.size()*sizeof(float),
+    // ----------------------------------------------------------------
+    // 8) Copy result back & compare
+    std::vector<float> y_out(blk0_elems);
+    CUDA_CHECK(cudaMemcpy(y_out.data(), dBlkOut,
+                          blk0_elems*sizeof(float),
                           cudaMemcpyDeviceToHost));
 
-    double max_abs=0.0, mean_abs=0.0;
+    double max_abs = 0.0;
+    double mean_abs = 0.0;
     for (size_t i=0;i<y_out.size();++i){
-        double d = std::fabs((double)y_out[i] - (double)y_expect[i]);
-        if (d > max_abs) max_abs = d;
-        mean_abs += d;
+        double diff = std::fabs((double)y_out[i] - (double)y_expect[i]);
+        if (diff > max_abs) max_abs = diff;
+        mean_abs += diff;
     }
     mean_abs /= y_out.size();
 
-    std::cout<<"Step3 stem+block0 forward done\n";
-    std::cout<<"  conv1 (im2col+gemm): "<<ms_conv1<<" ms\n";
-    std::cout<<"  bn1                : "<<ms_bn1<<" ms\n";
-    std::cout<<"  relu1              : "<<ms_relu1<<" ms\n";
-    std::cout<<"  maxpool            : "<<ms_pool<<" ms\n";
-    std::cout<<"  block0             : "<<ms_block<<" ms\n";
-    std::cout<<"Diff block0 out vs ref: max_abs="<<max_abs
-             <<" mean_abs="<<mean_abs<<"\n";
+    std::cout << "Step3 stem+block0 forward done\n";
+    std::cout << "  im2col (stem conv1): " << ms_im2col << " ms\n";
+    std::cout << "  gemm   (stem conv1): " << ms_gemm   << " ms\n";
+    std::cout << "  bn1+relu (stem)    : " << (ms_bn+ms_relu) << " ms\n";
+    std::cout << "  maxpool            : " << ms_pool   << " ms\n";
+    std::cout << "  block0 (layer1[0]) : " << ms_block0 << " ms\n";
+    std::cout << "Diff vs PyTorch     : max_abs=" << max_abs
+              << " mean_abs=" << mean_abs << "\n";
 
     if (max_abs <= 1e-4) {
-        std::cout<<"[OK] within atol 1e-4\n";
+        std::cout << "[OK] within atol 1e-4\n";
     } else {
-        std::cerr<<"[WARN] exceed atol 1e-4\n";
+        std::cerr << "[FAIL] exceed atol 1e-4\n";
     }
 
-    // --------------------------
-    // 6. cleanup
-    // --------------------------
+    // ----------------------------------------------------------------
+    // 9) cleanup
     cudaFree(dInput);
-    cudaFree(dCol);
-    cudaFree(dConv1Out);
+    cudaFree(dCol_stem);
+    cudaFree(dW_stem);
+    cudaFree(dStemOut);
     cudaFree(dPoolOut);
-    cudaFree(dBlockOut);
-    cudaFree(dTmp1);
-    cudaFree(dTmp2);
-    cudaFree(dColBlock);
 
-    cudaFree(dWconv1);
-    cudaFree(dBn1W); cudaFree(dBn1B); cudaFree(dBn1M); cudaFree(dBn1V);
+    cudaFree(dBn1_w);
+    cudaFree(dBn1_b);
+    cudaFree(dBn1_m);
+    cudaFree(dBn1_v);
 
-    cudaFree(dWblk1); cudaFree(dWblk2);
-    cudaFree(dBlk1W); cudaFree(dBlk1B); cudaFree(dBlk1M); cudaFree(dBlk1V);
-    cudaFree(dBlk2W); cudaFree(dBlk2B); cudaFree(dBlk2M); cudaFree(dBlk2V);
+    cudaFree(dCol_blk0);
+    cudaFree(dW_l10c1);
+    cudaFree(dW_l10c2);
+
+    cudaFree(dBlkTmp1);
+    cudaFree(dBlkTmp2);
+    cudaFree(dBlkOut);
+
+    cudaFree(dBn_l10bn1_w);
+    cudaFree(dBn_l10bn1_b);
+    cudaFree(dBn_l10bn1_m);
+    cudaFree(dBn_l10bn1_v);
+
+    cudaFree(dBn_l10bn2_w);
+    cudaFree(dBn_l10bn2_b);
+    cudaFree(dBn_l10bn2_m);
+    cudaFree(dBn_l10bn2_v);
 
     return 0;
 }
