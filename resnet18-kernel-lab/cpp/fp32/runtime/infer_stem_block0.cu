@@ -197,7 +197,7 @@ int main(int argc, char** argv){
     CUDA_CHECK(cudaMalloc(&dTmp1,     Cblk*H2*W2*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&dTmp2,     Cblk*H2*W2*sizeof(float)));
 
-    // block用 col buf (for convs inside block0)
+    // block col buf (for convs inside block0)
     float *dColBlock;
     CUDA_CHECK(cudaMalloc(&dColBlock, (Cblk*blk_kH*blk_kW)*(H2*W2)*sizeof(float)));
 
