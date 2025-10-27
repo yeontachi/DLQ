@@ -408,6 +408,21 @@ int main(int argc, char** argv){
         ms_gemm = T.stop();
     }
 
+     // === DEBUG DUMP: conv1 raw output BEFORE BN/RELU ===
+    {
+        size_t conv1_raw_elems = stem.OC * stem.OH * stem.OW; // 64*112*112
+        std::vector<float> conv1_raw(conv1_raw_elems);
+        CUDA_CHECK(cudaMemcpy(
+            conv1_raw.data(),
+            dStemOut,
+            conv1_raw_elems * sizeof(float),
+            cudaMemcpyDeviceToHost
+        ));
+        FILE* fc1 = fopen("debug_conv1_before_bn.bin", "wb");
+        fwrite(conv1_raw.data(), sizeof(float), conv1_raw.size(), fc1);
+        fclose(fc1);
+    }
+
     // (c) BN stem
     {
         int OH = stem.OH;
