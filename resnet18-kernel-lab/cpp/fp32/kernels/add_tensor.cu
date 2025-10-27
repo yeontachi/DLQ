@@ -1,10 +1,25 @@
-// cpp/fp32/kernels/add_tensor.cu
+/*
+add_tensor.cu
+
+Purpose:
+    Elementwise residual add for ResNet skip connection.
+    out[i] = a[i] + b[i]
+
+Signature contract:
+    extern "C" __global__
+    void tensor_add_fp32_kernel(
+        const float* a,
+        const float* b,
+        float* out,
+        int total);
+
+Notes:
+    - a, b, out 은 모두 같은 shape [N,C,H,W] (flattened as 1-D)
+    - total = N*C*H*W
+    - grid/block: 1D
+*/
 
 #include <cuda_runtime.h>
-#include "utils.hpp"
-
-// out[i] = a[i] + b[i], i in [0, total)
-// NCHW 전체를 단순 flat하게 본다.
 
 extern "C" __global__
 void tensor_add_fp32_kernel(
@@ -15,18 +30,6 @@ void tensor_add_fp32_kernel(
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
+
     out[idx] = a[idx] + b[idx];
-}
-
-inline void launch_tensor_add_fp32(
-    const float* a,
-    const float* b,
-    float* out,
-    int N, int C, int H, int W)
-{
-    int total = N*C*H*W;
-    dim3 blk(256);
-    dim3 grd((total + blk.x - 1)/blk.x);
-
-    tensor_add_fp32_kernel<<<grd, blk>>>(a,b,out,total);
 }
