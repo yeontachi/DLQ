@@ -6,6 +6,19 @@ set(SRCS
   runtime/infer_conv1_bn1_relu.cu   # ← 여기 .cu
 )
 add_executable(step2_conv1_bn1_relu ${SRCS})
+add_executable(infer_stem_block0
+    runtime/infer_stem_block0.cpp
+    kernels/im2col.cu
+    kernels/sgemm_tiled.cu
+    kernels/bn_inference.cu
+    kernels/relu.cu
+    kernels/maxpool2d.cu      # NEW
+    kernels/add_tensor.cu     # NEW
+    kernels/basic_block.cu    # NEW
+)
+
+# 그리고 CUDA 설정, include 경로, cublas 링크 등은
+# infer_conv1_bn1_relu 타깃과 동일하게 걸어주면 돼.
 
 target_include_directories(step2_conv1_bn1_relu
   PRIVATE
