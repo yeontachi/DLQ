@@ -1,19 +1,27 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-# 1) 빌드
-./scripts/build_fp32.sh
+# === Build target and paths ===
+BUILD=build/fp32/infer_stem_block0
+MANI=exports/resnet18/fp32
+INPUT=$MANI/sample_input.bin
+EXPECT=$MANI/sample_block0_out.bin
 
-# 2) 실행
-#   NOTE: 빌드 결과 바이너리가 어디에 생성되는지에 따라 경로 조정 필요.
-#   예: build/fp32/infer_stem_block0 또는 build/infer_stem_block0 등
-#   Step2에서 run_step2.sh가 어떻게 호출했는지 그대로 따라가.
-#
-#   아래는 예시 (빌드 결과가 build/fp32/ 아래에 있다고 가정):
+mkdir -p logs
+LOG=logs/step3_$(date +'%Y%m%d_%H%M%S').log
 
-BUILD_DIR=build/fp32
+# === Check build ===
+if [[ ! -x "$BUILD" ]]; then
+  echo "Error: $BUILD not found or not executable. Did you build?"
+  echo "Try: bash scripts/build_fp32.sh"
+  exit 1
+fi
 
-$BUILD_DIR/infer_stem_block0 \
-    --manifest exports/resnet18/fp32 \
-    --input exports/resnet18/fp32/sample_input.bin \
-    --expect exports/resnet18/fp32/sample_block0_out.bin
+# === Run + log ===
+{
+  echo "[Run Step3] $(date)"
+  echo "[Cmd] $BUILD --manifest $MANI --input $INPUT --expect $EXPECT"
+  "$BUILD" --manifest "$MANI" --input "$INPUT" --expect "$EXPECT"
+} | tee "$LOG"
+
+echo "Saved log -> $LOG"
