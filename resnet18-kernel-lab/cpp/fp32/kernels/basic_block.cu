@@ -1,285 +1,341 @@
-// cpp/fp32/kernels/basic_block.cu
+/*
+basic_block.cu
+
+ResNet18 BasicBlock (identity skip, no downsample)
+Structure:
+    y1 = ReLU( BN1( Conv1(x) ) )
+    y2 = BN2( Conv2(y1) )
+    out = ReLU( y2 + x )
+
+We assume:
+    - stride=1, padding=1, kernel=3x3 for both convs
+    - in/out channels are the same (e.g. 64 -> 64)
+    - spatial size unchanged across the block
+    - N typically = 1 here, but N is passed for generality
+
+This file provides:
+    extern "C"
+    void basic_block_fp32_forward_identity(...);
+
+It launches kernels:
+    im2col_nchw
+    sgemm_tiled
+    bn_inference
+    relu_forward
+    tensor_add_fp32_kernel
+*/
 
 #include <cuda_runtime.h>
-#include <cmath>
-#include "utils.hpp"
+#include <cmath>        // for nothing fancy, but keep parity with other .cu files
+#include "../runtime/utils.hpp"  // for CUDA_CHECK if you want to add checks (optional)
 
-// 외부 커널 선언 (Step2 스타일 그대로)
+// ---- Forward declarations for device kernels (must match definitions exactly)
+
 extern "C" __global__
-void im2col_nchw(const float*,
+void im2col_nchw(const float* x,
                  int N,int C,int H,int W,
-                 int KH,int KW,
-                 int SH,int SW,
-                 int PH,int PW,
-                 float* outCol);
+                 int kH,int kW,
+                 int sH,int sW,
+                 int pH,int pW,
+                 float* col);
 
 extern "C" __global__
-void sgemm_tiled(const float*, const float*, float*,
-                 int M, int N_, int K); 
-// NOTE: here M=OC, N_=OH*OW, K=C*KH*KW
+void sgemm_tiled(const float* A,
+                 const float* B,
+                 float* C,
+                 int M, int N_, int K);
 
 extern "C" __global__
-void bn_inference(float*,
-                  const float*,
-                  const float*,
-                  const float*,
-                  const float*,
+void bn_inference(float* x,
+                  const float* gamma,
+                  const float* beta,
+                  const float* mean,
+                  const float* var,
                   float eps,
                   int C, int H, int W);
 
 extern "C" __global__
-void relu_forward(float*, int total);
+void relu_forward(float* x,
+                  int total);
 
-// 우리가 Step3에서 새로 만든 것들
 extern "C" __global__
-void tensor_add_fp32_kernel(const float*,const float*,float*,int);
-inline void launch_tensor_add_fp32(const float*,const float*,float*,int,int,int,int);
+void tensor_add_fp32_kernel(const float* a,
+                            const float* b,
+                            float* out,
+                            int total);
 
-// conv/bn/relu 한 번 (3x3 stride=1 pad=1, 채널 유지 가정)
-// in   : [N,C,H,W]
-// w    : [Cout, C, kH, kW] (export에서 conv weight)
-// out  : [N,Cout,H,W] (stride=1 pad=1 가정이므로 H,W 동일)
-// tmpCol, tmpY : 임시버퍼 (col matrix, matmul out 등)
-// bn params: gamma,beta,mean,var,eps
-//
-// 이 helper는 block 내부에서만 쓸 거라 extern "C" 필요 X
+// ---------------------------------------------------------------------------
+// internal helper: conv + bn + relu
+// out shape: [N, Cout, H, W]
+// weights: d_wcol is [Cout, Cin * kH * kW]
+// d_colBuf: workspace of size (Cin * kH * kW) * (H*W)
 static void conv_bn_relu_once(
-    const float* d_in,
-    const float* d_w,
-    float* d_out,
-    float* d_colBuf,
-    // shapes
+    const float* d_in,           // [N,Cin,H,W]
+    float*       d_out,          // [N,Cout,H,W] (Cout==Cin for this block)
+    float*       d_colBuf,       // workspace
+    const float* d_wcol,         // [Cout, Cin*k*k]
+    const float* d_gamma,        // bn gamma (Cout)
+    const float* d_beta,         // bn beta (Cout)
+    const float* d_mean,         // bn running_mean (Cout)
+    const float* d_var,          // bn running_var (Cout)
+    float        bn_eps,
     int N, int C, int H, int W,
-    int Cout,
-    int kH, int kW,
-    int sH, int sW,
-    int pH, int pW,
-    // bn params
-    const float* d_gamma,
-    const float* d_beta,
-    const float* d_mean,
-    const float* d_var,
-    float eps,
-    cudaStream_t stream = 0
+    cudaStream_t stream
 ){
+    // kernel config
+    const int kH = 3, kW = 3;
+    const int sH = 1, sW = 1;
+    const int pH = 1, pW = 1;
+
+    // output spatial (stride=1,pad=1,k=3 => same H,W)
+    int OH = H;
+    int OW = W;
+
+    int KCOL = C * kH * kW;   // rows per output pixel / shared K dimension
+    int NCOL = OH * OW;       // number of output pixels per batch (N assumed 1)
+
     // 1. im2col
-    // output spatial size (OH, OW)
-    int OH = (H + 2*pH - kH)/sH + 1;
-    int OW = (W + 2*pW - kW)/sW + 1;
+    {
+        dim3 blk(16,16);
+        dim3 grd((OW + blk.x - 1)/blk.x,
+                 (OH + blk.y - 1)/blk.y);
 
-    int KCOL  = C*kH*kW;   // rows per output pixel
-    int NCOL  = OH*OW;     // number of output pixels
-    // d_colBuf: size KCOL * NCOL floats
-
-    dim3 blkIm2(16,16);
-    dim3 grdIm2((OW+blkIm2.x-1)/blkIm2.x,
-                (OH+blkIm2.y-1)/blkIm2.y);
-
-    im2col_nchw<<<grdIm2, blkIm2, 0, stream>>>(
-        d_in,
-        N,C,H,W,
-        kH,kW,
-        sH,sW,
-        pH,pW,
-        d_colBuf
-    );
-    CUDA_CHECK(cudaGetLastError());
+        im2col_nchw<<<grd, blk, 0, stream>>>(
+            d_in,
+            N, C, H, W,
+            kH, kW,
+            sH, sW,
+            pH, pW,
+            d_colBuf
+        );
+        // (Optional safety) CUDA_CHECK(cudaGetLastError());
+    }
 
     // 2. GEMM
-    // Y (Cout x NCOL) = W_col (Cout x KCOL) * Col (KCOL x NCOL)
-    // 여기서는 weight를 미리 [Cout, C*kH*kW]로 펴서 줘야 한다.
-    // => 호출하는 쪽에서 d_w는 이미 그런 형태로 준비돼 있다고 가정.
-    // (너 Step2 코드에서 Wcol 따로 만들어서 dW에 넣었지? 그 방식을 그대로 쓸 거야)
-    dim3 blkGemm(32,32);
-    dim3 grdGemm((NCOL+blkGemm.x-1)/blkGemm.x,
-                 (Cout+blkGemm.y-1)/blkGemm.y);
-
-    sgemm_tiled<<<grdGemm, blkGemm, 0, stream>>>(
-        d_w,        // [Cout, KCOL]
-        d_colBuf,   // [KCOL, NCOL]
-        d_out,      // [Cout, NCOL] => which we interpret as [N=1,Cout,OH,OW]
-        Cout, NCOL, KCOL
-    );
-    CUDA_CHECK(cudaGetLastError());
-
-    // 3. BN inference (in-place)
-    //   bn_inference<<<grid,block>>>(d_out, gamma,beta,mean,var,eps, C, H, W)
+    // d_out is [Cout, OH*OW] laid out row-major, we'll treat N=1 so that also stands for [N,Cout,OH,OW]
     {
-        int total_spatial = Cout*OH*OW;
-        dim3 blkBN(256);
-        dim3 grdBN((total_spatial+blkBN.x-1)/blkBN.x);
+        dim3 blk(32,32);
+        dim3 grd((NCOL + blk.x - 1)/blk.x,
+                 (C     + blk.y - 1)/blk.y);
+        // NOTE: here Cout == C for identity block. If not, pass Cout instead of C.
 
-        bn_inference<<<grdBN, blkBN, 0, stream>>>(
+        sgemm_tiled<<<grd, blk, 0, stream>>>(
+            d_wcol,     // [Cout, KCOL]
+            d_colBuf,   // [KCOL, NCOL]
+            d_out,      // [Cout, NCOL]
+            C,          // M (= Cout)
+            NCOL,       // N_
+            KCOL        // K
+        );
+        // CUDA_CHECK(cudaGetLastError());
+    }
+
+    // 3. BN inplace on d_out
+    {
+        int total_spatial = C * OH * OW;
+        dim3 blk(256);
+        dim3 grd((total_spatial + blk.x - 1)/blk.x);
+
+        bn_inference<<<grd, blk, 0, stream>>>(
             d_out,
             d_gamma,
             d_beta,
             d_mean,
             d_var,
-            eps,
-            Cout, OH, OW
+            bn_eps,
+            C, OH, OW
         );
-        CUDA_CHECK(cudaGetLastError());
+        // CUDA_CHECK(cudaGetLastError());
     }
 
-    // 4. ReLU (in-place)
+    // 4. ReLU inplace on d_out
     {
-        int total_relu = Cout*OH*OW;
-        dim3 blkReLU(256);
-        dim3 grdReLU((total_relu+blkReLU.x-1)/blkReLU.x);
+        int total_relu = C * OH * OW;
+        dim3 blk(256);
+        dim3 grd((total_relu + blk.x - 1)/blk.x);
 
-        relu_forward<<<grdReLU, blkReLU, 0, stream>>>(
+        relu_forward<<<grd, blk, 0, stream>>>(
             d_out,
             total_relu
         );
-        CUDA_CHECK(cudaGetLastError());
+        // CUDA_CHECK(cudaGetLastError());
     }
 }
 
-// basic block 전체
-// d_x      : [N,C,H,W]  (also skip input)
-// d_out    : [N,C,H,W]
-// d_tmp1   : [N,C,H,W] scratch (will hold y1 after first conv/bn/relu)
-// d_tmp2   : [N,C,H,W] scratch (will hold y2 after second conv/bn (no relu yet))
-// d_colBuf : workspace for im2col (size = C*kH*kW * H*W)  <-- we'll reuse same buf
+// ---------------------------------------------------------------------------
+// internal helper: conv + bn (NO relu at end)
+// writes into d_out
+static void conv_bn_only_once(
+    const float* d_in,           // [N,C,H,W]
+    float*       d_out,          // [N,C,H,W]
+    float*       d_colBuf,       // workspace
+    const float* d_wcol,         // weights flattened
+    const float* d_gamma,
+    const float* d_beta,
+    const float* d_mean,
+    const float* d_var,
+    float        bn_eps,
+    int N, int C, int H, int W,
+    cudaStream_t stream
+){
+    const int kH = 3, kW = 3;
+    const int sH = 1, sW = 1;
+    const int pH = 1, pW = 1;
+
+    int OH = H;
+    int OW = W;
+
+    int KCOL = C * kH * kW;
+    int NCOL = OH * OW;
+
+    // im2col
+    {
+        dim3 blk(16,16);
+        dim3 grd((OW + blk.x - 1)/blk.x,
+                 (OH + blk.y - 1)/blk.y);
+
+        im2col_nchw<<<grd, blk, 0, stream>>>(
+            d_in,
+            N, C, H, W,
+            kH, kW,
+            sH, sW,
+            pH, pW,
+            d_colBuf
+        );
+        // CUDA_CHECK(cudaGetLastError());
+    }
+
+    // GEMM
+    {
+        dim3 blk(32,32);
+        dim3 grd((NCOL + blk.x - 1)/blk.x,
+                 (C     + blk.y - 1)/blk.y);
+
+        sgemm_tiled<<<grd, blk, 0, stream>>>(
+            d_wcol,
+            d_colBuf,
+            d_out,
+            C,        // M
+            NCOL,     // N_
+            KCOL      // K
+        );
+        // CUDA_CHECK(cudaGetLastError());
+    }
+
+    // BN (no relu)
+    {
+        int total_spatial = C * OH * OW;
+        dim3 blk(256);
+        dim3 grd((total_spatial + blk.x - 1)/blk.x);
+
+        bn_inference<<<grd, blk, 0, stream>>>(
+            d_out,
+            d_gamma,
+            d_beta,
+            d_mean,
+            d_var,
+            bn_eps,
+            C, OH, OW
+        );
+        // CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// public API: full residual block forward (identity skip)
+//  - d_x: input [N,C,H,W] (also the skip branch)
+//  - d_out: final output [N,C,H,W]
+//  - d_tmp1: scratch [N,C,H,W]
+//  - d_tmp2: scratch [N,C,H,W]
+//  - d_colBuf: workspace [(C*3*3)*(H*W)]
 //
-// conv1 weights are assumed pre-flattened to [Cout, C*kH*kW] like Step2's Wcol
-// conv2 weights same idea.
+//  weights/bn params are already on device and flattened
+//
+//  N,C,H,W are shape of d_x (and also d_out)
+//
+// NOTE: For ResNet18 layer1[0], C == 64, N == 1, H == W == 56.
 //
 extern "C"
 void basic_block_fp32_forward_identity(
-    const float* d_x,
-    float* d_out,
-    float* d_tmp1,
-    float* d_tmp2,
-    float* d_colBuf, // workspace for im2col/GEMM
+    const float* d_x,        // input / identity skip
+    float* d_out,            // final output
+    float* d_tmp1,           // after conv1/bn/relu
+    float* d_tmp2,           // after conv2/bn
+    float* d_colBuf,         // workspace
 
-    // conv1 params
-    const float* d_w1col,
-    int N, int C, int H, int W,
-    int C1out,
-    int k1H,int k1W,
-    int s1H,int s1W,
-    int p1H,int p1W,
+    const float* d_w1col,    // conv1 weights flattened
     const float* d_bn1_gamma,
     const float* d_bn1_beta,
     const float* d_bn1_mean,
     const float* d_bn1_var,
     float bn1_eps,
 
-    // conv2 params
-    const float* d_w2col,
-    int C2out,
-    int k2H,int k2W,
-    int s2H,int s2W,
-    int p2H,int p2W,
+    const float* d_w2col,    // conv2 weights flattened
     const float* d_bn2_gamma,
     const float* d_bn2_beta,
     const float* d_bn2_mean,
     const float* d_bn2_var,
     float bn2_eps,
 
+    int N, int C, int H, int W,
+
     cudaStream_t stream
 ){
-    // 1. tmp1 = conv1+bn+relu(x)
+    // 1. y1 = conv1+bn1+relu(d_x)
     conv_bn_relu_once(
         d_x,
-        d_w1col,
         d_tmp1,
         d_colBuf,
-        N,C,H,W,
-        C1out,
-        k1H,k1W,
-        s1H,s1W,
-        p1H,p1W,
+        d_w1col,
         d_bn1_gamma,
         d_bn1_beta,
         d_bn1_mean,
         d_bn1_var,
         bn1_eps,
+        N, C, H, W,
         stream
     );
 
-    // 2. tmp2 = conv2+bn(tmp1)  (여기서는 마지막 relu 안 함)
+    // 2. y2 = conv2+bn2(d_tmp1)
+    conv_bn_only_once(
+        d_tmp1,
+        d_tmp2,
+        d_colBuf,
+        d_w2col,
+        d_bn2_gamma,
+        d_bn2_beta,
+        d_bn2_mean,
+        d_bn2_var,
+        bn2_eps,
+        N, C, H, W,
+        stream
+    );
+
+    // 3. out = y2 + x  (residual add)
     {
-        // conv2 + bn (no relu)
-        // conv_bn_relu_once를 그대로 쓰면 relu까지 넣어버리니까
-        // 여기서는 conv+bn만 수동으로 반복한다
+        int total = N * C * H * W;
+        dim3 blk(256);
+        dim3 grd((total + blk.x - 1)/blk.x);
 
-        // 2-1. im2col(tmp1)
-        int OH = H; // stride=1,pad=1,k=3 가정이라서 spatial 유지
-        int OW = W;
-        int KCOL = C1out * k2H * k2W;
-        int NCOL = OH * OW;
-
-        dim3 blkIm2(16,16);
-        dim3 grdIm2((OW+blkIm2.x-1)/blkIm2.x,
-                    (OH+blkIm2.y-1)/blkIm2.y);
-
-        im2col_nchw<<<grdIm2, blkIm2, 0, stream>>>(
-            d_tmp1,
-            N, C1out, H, W,
-            k2H, k2W,
-            s2H, s2W,
-            p2H, p2W,
-            d_colBuf
-        );
-        CUDA_CHECK(cudaGetLastError());
-
-        // 2-2. GEMM: tmp2 = w2col * colBuf
-        dim3 blkGemm(32,32);
-        dim3 grdGemm((NCOL+blkGemm.x-1)/blkGemm.x,
-                     (C2out+blkGemm.y-1)/blkGemm.y);
-
-        sgemm_tiled<<<grdGemm, blkGemm, 0, stream>>>(
-            d_w2col,
-            d_colBuf,
-            d_tmp2,
-            C2out, NCOL, KCOL
-        );
-        CUDA_CHECK(cudaGetLastError());
-
-        // 2-3. bn_inference(tmp2)
-        int total_spatial = C2out * OH * OW;
-        dim3 blkBN(256);
-        dim3 grdBN((total_spatial+blkBN.x-1)/blkBN.x);
-
-        bn_inference<<<grdBN, blkBN, 0, stream>>>(
-            d_tmp2,
-            d_bn2_gamma,
-            d_bn2_beta,
-            d_bn2_mean,
-            d_bn2_var,
-            bn2_eps,
-            C2out, OH, OW
-        );
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    // 3. out = tmp2 + x  (identity skip)
-    {
-        int total = C*H*W; // C == C2out == C1out == block channels
-        dim3 blkAdd(256);
-        dim3 grdAdd((total+blkAdd.x-1)/blkAdd.x);
-
-        tensor_add_fp32_kernel<<<grdAdd, blkAdd, 0, stream>>>(
+        tensor_add_fp32_kernel<<<grd, blk, 0, stream>>>(
             d_tmp2,
             d_x,
             d_out,
             total
         );
-        CUDA_CHECK(cudaGetLastError());
+        // CUDA_CHECK(cudaGetLastError());
     }
 
-    // 4. relu(out)
+    // 4. ReLU(out)
     {
-        int total_relu = C*H*W;
-        dim3 blkReLU(256);
-        dim3 grdReLU((total_relu+blkReLU.x-1)/blkReLU.x);
+        int total = N * C * H * W;
+        dim3 blk(256);
+        dim3 grd((total + blk.x - 1)/blk.x);
 
-        relu_forward<<<grdReLU, blkReLU, 0, stream>>>(
+        relu_forward<<<grd, blk, 0, stream>>>(
             d_out,
-            total_relu
+            total
         );
-        CUDA_CHECK(cudaGetLastError());
+        // CUDA_CHECK(cudaGetLastError());
     }
 }
