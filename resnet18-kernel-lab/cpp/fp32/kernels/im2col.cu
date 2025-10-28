@@ -7,8 +7,63 @@ Why  : 컨볼루션을 행렬곱(GEMM)으로 바꾸어 고성능 BLAS/cuBLAS를 
 HOW  : 출력 위치마다(oh, ow) 윈도우를 꺼내 길이 C*kH*kW 벡터로 펼침 -> col의 한 열에 저장
        패딩/스트라이드 반영 : OH = (H + 2pH -kH)/sH + 1, OW = (W + 2pW - kW)/sW + 1
 */
+
+
+
+
 #include <cuda_runtime.h>
 
+extern "C" __global__
+void im2col_nchw(
+    const float* __restrict__ x,
+    int N, int C, int H, int W,
+    int kH, int kW,
+    int sH, int sW,
+    int pH, int pW,
+    float* __restrict__ col // [C*kH*kW, OH*OW] row-major
+){
+    // N=1 가정
+    int n = 0;
+
+    int OH = (H + 2*pH - kH)/sH + 1;
+    int OW = (W + 2*pW - kW)/sW + 1;
+
+    int oh = blockIdx.y * blockDim.y + threadIdx.y;
+    int ow = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (oh >= OH || ow >= OW) return;
+
+    // 🔁 바뀐 부분: 열 인덱스 계산
+    // 기존: int out_index = oh * OW + ow;
+    // 새로: PyTorch unfold이랑 맞추기 위해 가설적으로 뒤집어본다
+    int out_index = ow * OH + oh;
+
+    // row-major interpretation: row=r, col=out_index
+    int colStride = OH * OW; // number of columns
+
+    for (int c = 0; c < C; ++c){
+        for (int kh = 0; kh < kH; ++kh){
+            for (int kw = 0; kw < kW; ++kw){
+
+                int ih = oh * sH - pH + kh;
+                int iw = ow * sW - pW + kw;
+
+                float v = 0.f;
+                if (ih >= 0 && iw >= 0 && ih < H && iw < W){
+                    // N=1 -> index within NCHW is c*H*W + ih*W + iw
+                    int idx = c * H * W + ih * W + iw;
+                    v = x[idx];
+                }
+
+                int r = c * kH * kW + kh * kW + kw;
+
+                col[r * colStride + out_index] = v;
+            }
+        }
+    }
+}
+
+/*
 // x: 입력(N*C*H*W, 여기선 N=1만 처리)
 // col: 출력((C*kH*kW) x (N*OH*OW)) 행렬을 1D(row-major)로 저장
 extern "C" __global__
@@ -65,3 +120,4 @@ void im2col_nchw(const float* __restrict__ x, // input: N*C*H*W
         }
     }
 }
+*/

@@ -37,9 +37,9 @@ void im2col_nchw(const float* x,
                  float* col);
 
 extern "C" __global__
-void sgemm_tiled(const float* A,
-                 const float* B,
-                 float* C,
+void sgemm_tiled(const float* __restrict__ A,
+                 const float* __restrict__ B,
+                 float* __restrict__ C,
                  int M, int N_, int K);
 
 extern "C" __global__
@@ -388,6 +388,21 @@ int main(int argc, char** argv){
         CUDA_CHECK(cudaDeviceSynchronize());
         ms_im2col = T.stop();
     }
+
+    {
+        size_t col_elems = stem.KCOL * stem.NCOL; // (C*kH*kW) * (OH*OW) = 147 * 12544
+        std::vector<float> col_host(col_elems);
+        CUDA_CHECK(cudaMemcpy(
+            col_host.data(),
+            dCol_stem,
+            col_elems * sizeof(float),
+            cudaMemcpyDeviceToHost
+        ));
+        FILE* fcol = fopen("debug_im2col.bin", "wb");
+        fwrite(col_host.data(), sizeof(float), col_host.size(), fcol);
+        fclose(fcol);
+    }
+
 
     // (b) GEMM: stem conv1
     {
