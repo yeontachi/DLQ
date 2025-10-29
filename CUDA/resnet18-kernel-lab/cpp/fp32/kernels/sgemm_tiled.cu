@@ -1,8 +1,3 @@
-/*
-sgemm_tiled.cu
-> 이 커널은 행렬곱 C = A(MxK)*B(KxN)를 타일링(shared Memory)으로 가속하는 FP32 SGEMM이다.
-각 블록이 TILE x TILE 크기의 C 서브 블록을 계산하고, A/B에서 같은 크기의 타일을 공유 메모리에 가져와 곱-누적(Accumulate)한다.
-*/
 #include <cuda_runtime.h>
 #define TILE 32
 
@@ -11,7 +6,7 @@ extern "C" __global__
 void sgemm_tiled(const float* __restrict__ A, // MxK
                  const float* __restrict__ B, // KxN
                  float* __restrict__ C,       // MxN
-                 int M, int N, int K)
+                 int M,int N,int K)
 {
     // 블록이 사용할 A/B의 타일(공유메모리) 버퍼
     __shared__ float As[TILE][TILE], Bs[TILE][TILE];
@@ -23,21 +18,21 @@ void sgemm_tiled(const float* __restrict__ A, // MxK
     // 누적 레지스터
     float acc = 0.f;
 
-    // K 차원을 TILE씩 순회하며 A와 B의 대응 타일을 로드 -> 곱 -> 누적
-    for (int t = 0; t < (K + TILE - 1)/TILE; ++t){
+    // K 차원을 TILE씩 순회하며 A와 B의 대응 타일을 로드→곱→누적
+    for (int t = 0; t < (K + TILE - 1) / TILE; ++t) {
         // 현재 타일에서 A의 열, B의 행 인덱스
-        int aCol = t * TILE + threadIdx.x;    // A[row, aCol]
-        int bRow = t * TILE + threadIdx.y;    // B[bRow, col]
+        int aCol = t * TILE + threadIdx.x;   // A[row, aCol]
+        int bRow = t * TILE + threadIdx.y;   // B[bRow, col]
 
         // 경계 체크 후 공유메모리에 로드 (out-of-range는 0 패딩)
         As[threadIdx.y][threadIdx.x] = (row < M && aCol < K) ? A[row * K + aCol] : 0.f;
         Bs[threadIdx.y][threadIdx.x] = (bRow < K && col < N) ? B[bRow * N + col] : 0.f;
 
-        __syncthreads();  // 타일 로드 동기화
+        __syncthreads(); // 타일 로드 동기화
 
         // 타일 내 곱-누적: (TILE 길이 내적)
         #pragma unroll
-        for(int k = 0; k < TILE; ++k){
+        for (int k = 0; k < TILE; ++k) {
             acc += As[threadIdx.y][k] * Bs[k][threadIdx.x];
         }
 
@@ -45,7 +40,7 @@ void sgemm_tiled(const float* __restrict__ A, // MxK
     }
 
     // 경계 내면 결과 저장
-    if (row < M && col < N){
+    if (row < M && col < N) {
         C[row * N + col] = acc;
     }
 }

@@ -11,3 +11,13 @@ if [[ ! -x "$BIN" ]]; then
 fi
 
 "$BIN" --manifest "$MANI"
+
+
+# 실행 + 로그 저장
+{
+  echo "[Run] $(date)"
+  echo "[Cmd] $BUILD --manifest $MANI --input $MANI/fixtures/input.bin --expect $MANI/fixtures/expected.bin"
+  "$BUILD" --manifest "$MANI" --input "$MANI/fixtures/input.bin" --expect "$MANI/fixtures/expected.bin"
+} | tee "$LOG"
+
+echo "Saved log -> $LOG"

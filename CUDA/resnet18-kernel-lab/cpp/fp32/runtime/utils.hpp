@@ -24,6 +24,19 @@ inline std::vector<float> load_bin_f32(const std::string& path, size_t expected 
     return v;
 }
 
+// 커널 선언
+extern "C" __global__
+void im2col_nchw(const float*,int,int,int,int,int,int,int,int,int,int,float*);
+
+extern "C" __global__
+void sgemm_tiled(const float*,const float*,float*,int,int,int);
+
+extern "C" __global__
+void bn_inference(float*,const float*,const float*,const float*,const float*,float,int,int,int);
+
+extern "C" __global__
+void relu_forward(float*,int);
+
 struct Timer {
     cudaEvent_t a,b;
     Timer(){ CUDA_CHECK(cudaEventCreate(&a)); CUDA_CHECK(cudaEventCreate(&b)); }
@@ -31,4 +44,34 @@ struct Timer {
     void start(){ CUDA_CHECK(cudaEventRecord(a)); }
     float stop(){ CUDA_CHECK(cudaEventRecord(b)); CUDA_CHECK(cudaEventSynchronize(b));
                   float ms=0; CUDA_CHECK(cudaEventElapsedTime(&ms,a,b)); return ms; }
+};
+
+// utils.hpp 끝부분에 추가 (선택)
+// 간단한 호환 래퍼: 실제로는 load_bin_f32를 감싸서 반환만 맞춤
+struct CmdArgs { std::string manifest; };
+inline CmdArgs parse_args(int argc, char** argv) {
+    CmdArgs a;
+    for (int i=1;i<argc;i++){
+        std::string s = argv[i];
+        if (s=="--manifest" && i+1<argc) a.manifest = argv[++i];
+    }
+    return a;
+}
+struct Tensor {
+    std::vector<float> buf;
+    float* data() { return buf.data(); }
+    const float* data() const { return buf.data(); }
+    size_t size() const { return buf.size(); }
+};
+
+inline Tensor load_bin(const std::string& path, size_t n_elems) {
+    Tensor t; t.buf = load_bin_f32(path, n_elems); return t;
+}
+struct Manifest {
+    std::string root;
+    explicit Manifest(std::string r): root(std::move(r)){}
+    // 주의: 실제 manifest.json 파싱은 안 함. 호출부에서 개수를 제공해야 함.
+    Tensor load(const std::string& name, size_t n_elems) {
+        return load_bin(root + "/" + name + ".bin", n_elems);
+    }
 };

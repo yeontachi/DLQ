@@ -7,10 +7,13 @@
 // 커널 선언
 extern "C" __global__
 void im2col_nchw(const float*,int,int,int,int,int,int,int,int,int,int,float*);
+
 extern "C" __global__
 void sgemm_tiled(const float*,const float*,float*,int,int,int);
+
 extern "C" __global__
 void bn_inference(float*,const float*,const float*,const float*,const float*,float,int,int,int);
+
 extern "C" __global__
 void relu_forward(float*,int);
 
