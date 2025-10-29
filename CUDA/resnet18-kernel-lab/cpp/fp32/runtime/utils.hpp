@@ -6,6 +6,9 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cstdio>
+#include <memory>
+#include <utility>   // std::pair
+#include <cassert>
 
 static inline int div_up(int a, int b) { return (a + b - 1) / b; }
 static inline int max3(int a, int b, int c){ return std::max(a, std::max(b,c)); }
@@ -91,3 +94,53 @@ struct Manifest {
         return load_bin(root + "/" + name + ".bin", n_elems);
     }
 };
+
+// CUDA 에러 체크 매크로가 이미 있다면 중복 정의 금지
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call)                                                     \
+    do {                                                                     \
+        cudaError_t _err = (call);                                           \
+        if (_err != cudaSuccess) {                                           \
+            fprintf(stderr, "CUDA error %s @ %s:%d\n",                       \
+                    cudaGetErrorString(_err), __FILE__, __LINE__);           \
+            std::exit(1);                                                    \
+        }                                                                    \
+    } while (0)
+#endif
+
+// 디바이스 메모리 unique_ptr 삭제자
+struct DeviceDeleter {
+    void operator()(float* p) const noexcept {
+        if (p) cudaFree(p);
+    }
+};
+
+// host vector<float> -> device float* (unique_ptr로 관리)
+inline std::unique_ptr<float, DeviceDeleter>
+copy_to_device(const std::vector<float>& host)
+{
+    float* d = nullptr;
+    size_t bytes = host.size() * sizeof(float);
+    CUDA_CHECK(cudaMalloc(&d, bytes));
+    if (!host.empty()) {
+        CUDA_CHECK(cudaMemcpy(d, host.data(), bytes, cudaMemcpyHostToDevice));
+    }
+    return std::unique_ptr<float, DeviceDeleter>(d);
+}
+
+// 두 벡터 차이의 (max_abs, mean_abs) 계산
+inline std::pair<double,double>
+diff_max_mean(const std::vector<float>& a, const std::vector<float>& b)
+{
+    assert(a.size() == b.size());
+    const size_t n = a.size();
+    double max_abs = 0.0;
+    double mean_abs = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        double d = std::abs((double)a[i] - (double)b[i]);
+        if (d > max_abs) max_abs = d;
+        mean_abs += d;
+    }
+    if (n) mean_abs /= (double)n;
+    return {max_abs, mean_abs};
+}

@@ -25,10 +25,6 @@ void relu_forward(float*,int);
 extern "C" __global__
 void add_inplace(float* y, const float* x, int n); // elemwise add (y+=x)
 
-// ===== 유틸 =====
-static inline int div_up(int a, int b) { return (a + b - 1) / b; }
-static inline int max3(int a, int b, int c) { return std::max(a, std::max(b, c)); }
-
 #define CUDA_LAUNCH(kernel, grid, block, ...) \
 do { \
   kernel<<<grid, block>>>(__VA_ARGS__); \

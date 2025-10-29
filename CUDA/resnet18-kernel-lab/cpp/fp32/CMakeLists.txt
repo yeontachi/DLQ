@@ -54,3 +54,16 @@ add_executable(step4_layer2
 target_include_directories(step4_layer2 PRIVATE ${CMAKE_CURRENT_LIST_DIR}/runtime)
 target_link_libraries(step4_layer2 PRIVATE CUDA::cudart)
 set_target_properties(step4_layer2 PROPERTIES CUDA_ARCHITECTURES "native")
+
+
+add_executable(step5_layer3
+  kernels/im2col.cu
+  kernels/sgemm_tiled.cu
+  kernels/bn_inference.cu
+  kernels/relu.cu
+  kernels/add.cu
+  runtime/infer_layer3.cu
+)
+target_include_directories(step5_layer3 PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(step5_layer3 PRIVATE cudart)
+set_target_properties(step5_layer3 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
