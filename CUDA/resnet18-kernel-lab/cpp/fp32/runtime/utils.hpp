@@ -4,6 +4,22 @@
 #include <fstream>
 #include <iostream>
 #include <cuda_runtime.h>
+#include <algorithm>
+#include <cstdio>
+
+static inline int div_up(int a, int b) { return (a + b - 1) / b; }
+static inline int max3(int a, int b, int c){ return std::max(a, std::max(b,c)); }
+
+#define CUDA_LAUNCH(kernel, grid, block, ...) \
+do { \
+  kernel<<<grid, block>>>(__VA_ARGS__); \
+  cudaError_t __e = cudaGetLastError(); \
+  if (__e != cudaSuccess){ \
+    fprintf(stderr, "CUDA launch error %s @ %s:%d\n", cudaGetErrorString(__e), __FILE__, __LINE__); \
+    return 3; \
+  } \
+} while(0)
+
 
 inline void cudaCheck(cudaError_t e, const char* f, int l){
     if (e!=cudaSuccess){ std::cerr<<"CUDA "<<cudaGetErrorString(e)

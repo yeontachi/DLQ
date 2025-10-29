@@ -42,3 +42,15 @@ set_target_properties(step3_layer1 PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
   RUNTIME_OUTPUT_DIRECTORY ${FP32_OUTDIR}
 )
+
+add_executable(step4_layer2
+  runtime/infer_layer2.cu
+  kernels/im2col.cu
+  kernels/sgemm_tiled.cu
+  kernels/bn_inference.cu
+  kernels/relu.cu
+  kernels/add.cu
+)
+target_include_directories(step4_layer2 PRIVATE ${CMAKE_CURRENT_LIST_DIR}/runtime)
+target_link_libraries(step4_layer2 PRIVATE CUDA::cudart)
+set_target_properties(step4_layer2 PROPERTIES CUDA_ARCHITECTURES "native")
