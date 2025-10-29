@@ -1,45 +1,34 @@
-cmake_minimum_required(VERSION 3.18)
-project(resnet18_fp32 LANGUAGES CXX CUDA)
+# 실행파일이 build/fp32/ 아래로 나오게
+set(FP32_OUTDIR ${CMAKE_BINARY_DIR}/fp32)
 
-set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-set(CMAKE_BUILD_TYPE Release)
+set(FP32_KERNELS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/kernels)
+set(FP32_RUNTIME_DIR ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
 
-# Include dirs
-include_directories(
-    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
-    ${CMAKE_CURRENT_SOURCE_DIR}/kernels
+set(FP32_INCLUDES
+  ${FP32_RUNTIME_DIR}
+  ${FP32_KERNELS_DIR}
+  ${CUDAToolkit_INCLUDE_DIRS}
 )
 
-# 공통 CUDA 커널들
-set(FP32_KERNELS
-    kernels/im2col.cu
-    kernels/sgemm_tiled.cu
-    kernels/bn_inference.cu
-    kernels/relu.cu
-    kernels/maxpool2d.cu
-    kernels/add_tensor.cu
-    kernels/basic_block.cu
+# ===== 공통 커널(실제 파일이 존재해야 함) =====
+set(KERNELS_COMMON
+  ${FP32_KERNELS_DIR}/im2col.cu
+  ${FP32_KERNELS_DIR}/sgemm_tiled.cu
+  ${FP32_KERNELS_DIR}/bn_inference.cu
+  ${FP32_KERNELS_DIR}/relu.cu
 )
 
-# Step2 실행 타깃
-add_executable(infer_conv1_bn1_relu
-    runtime/infer_conv1_bn1_relu.cu
-    ${FP32_KERNELS}
+# ===== Step2 실행파일 =====
+add_executable(step2_conv1_bn1_relu
+  ${KERNELS_COMMON}
+  ${FP32_RUNTIME_DIR}/infer_conv1_bn1_relu.cu  # 확장자 .cu (커널 런치가 있어서)
 )
 
-# Step3 실행 타깃
-add_executable(infer_stem_block0
-    runtime/infer_stem_block0.cu
-    ${FP32_KERNELS}
+target_include_directories(step2_conv1_bn1_relu PRIVATE ${FP32_INCLUDES})
+target_link_libraries(step2_conv1_bn1_relu PRIVATE CUDA::cudart)
+set_target_properties(step2_conv1_bn1_relu PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+  RUNTIME_OUTPUT_DIRECTORY ${FP32_OUTDIR}
 )
 
-# 공통 속성
-foreach(tgt infer_conv1_bn1_relu infer_stem_block0)
-    set_target_properties(${tgt} PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON
-    )
-    target_compile_options(${tgt} PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:-O3 --use_fast_math -lineinfo -arch=sm_80>
-    )
-endforeach()
+message(STATUS "FP32 binaries -> ${FP32_OUTDIR}")
