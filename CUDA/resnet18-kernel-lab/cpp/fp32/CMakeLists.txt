@@ -80,3 +80,18 @@ add_executable(step6_layer4
 target_include_directories(step6_layer4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
 target_link_libraries(step6_layer4 PRIVATE CUDA::cudart)
 set_target_properties(step6_layer4 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+# ... (기존 내용 유지)
+
+add_executable(step7_head
+    kernels/im2col.cu          # 이미 사용 중이면 그대로
+    kernels/sgemm_tiled.cu
+    kernels/relu.cu            # 필요없어도 링크 편의상 유지 가능
+    kernels/bn_inference.cu    # 필요없어도 링크 편의상 유지 가능
+    kernels/gap_global.cu      # <-- 신규
+    kernels/softmax.cu         # <-- 신규
+    runtime/infer_head.cu      # <-- 신규
+)
+target_include_directories(step7_head PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(step7_head PRIVATE CUDA::cudart)
+set_target_properties(step7_head PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
