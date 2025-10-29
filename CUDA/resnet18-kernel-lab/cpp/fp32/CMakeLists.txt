@@ -95,3 +95,19 @@ add_executable(step7_head
 target_include_directories(step7_head PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 target_link_libraries(step7_head PRIVATE CUDA::cudart)
 set_target_properties(step7_head PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+
+# Step8 E2E
+add_executable(step8_e2e
+    runtime/infer_e2e.cu
+    kernels/im2col.cu
+    kernels/sgemm_tiled.cu
+    kernels/bn_inference.cu
+    kernels/relu.cu
+    kernels/add.cu
+    kernels/gap_global.cu    
+)
+
+target_include_directories(step8_e2e PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(step8_e2e PRIVATE CUDA::cudart)
+set_target_properties(step8_e2e PROPERTIES CUDA_SEPARABLE_COMPILATION ON)

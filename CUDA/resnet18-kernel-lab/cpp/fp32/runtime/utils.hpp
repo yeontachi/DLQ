@@ -151,3 +151,22 @@ diff_max_mean(const std::vector<float>& a, const std::vector<float>& b)
     if (n) mean_abs /= (double)n;
     return {max_abs, mean_abs};
 }
+// utils.hpp 하단(기존 copy_to_device(vector<>) 아래)에 추가
+inline std::unique_ptr<float, DeviceDeleter>
+copy_to_device(const float* src, size_t n_elems)
+{
+    float* d = nullptr;
+    size_t bytes = n_elems * sizeof(float);
+    CUDA_CHECK(cudaMalloc(&d, bytes));
+    if (n_elems > 0 && src) {
+        CUDA_CHECK(cudaMemcpy(d, src, bytes, cudaMemcpyHostToDevice));
+    }
+    return std::unique_ptr<float, DeviceDeleter>(d);
+}
+
+// utils.hpp 하단 어딘가
+inline void save_bin_f32(const std::string& path, const std::vector<float>& v) {
+    std::ofstream ofs(path, std::ios::binary);
+    if (!ofs) { std::cerr << "open fail (write): " << path << "\n"; std::exit(1); }
+    ofs.write(reinterpret_cast<const char*>(v.data()), v.size()*sizeof(float));
+}
