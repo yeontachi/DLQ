@@ -67,3 +67,16 @@ add_executable(step5_layer3
 target_include_directories(step5_layer3 PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 target_link_libraries(step5_layer3 PRIVATE cudart)
 set_target_properties(step5_layer3 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+# cpp/fp32/CMakeLists.txt (추가 블록)
+add_executable(step6_layer4
+    kernels/im2col.cu
+    kernels/sgemm_tiled.cu
+    kernels/bn_inference.cu
+    kernels/relu.cu
+    kernels/add.cu
+    runtime/infer_layer4.cu
+)
+target_include_directories(step6_layer4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
+target_link_libraries(step6_layer4 PRIVATE CUDA::cudart)
+set_target_properties(step6_layer4 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
