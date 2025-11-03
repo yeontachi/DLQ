@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT/build/fp32/step8_e2e"
 MANI="$ROOT/exports/resnet18/fp32"
-IMDIR="$ROOT/data/imagenet_val/ILSVRC2012_img_val"   # ← 사용자가 알려준 경로
+IMDIR="$ROOT/data/imagenet_val/ILSVRC2012_img_val"   
 PY="$ROOT/tools/bench_fp32_vs_torch.py"
 
 if [[ ! -x "$BIN" ]]; then
