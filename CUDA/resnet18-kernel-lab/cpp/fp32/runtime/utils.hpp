@@ -164,9 +164,13 @@ copy_to_device(const float* src, size_t n_elems)
     return std::unique_ptr<float, DeviceDeleter>(d);
 }
 
-// utils.hpp 하단 어딘가
 inline void save_bin_f32(const std::string& path, const std::vector<float>& v) {
     std::ofstream ofs(path, std::ios::binary);
     if (!ofs) { std::cerr << "open fail (write): " << path << "\n"; std::exit(1); }
     ofs.write(reinterpret_cast<const char*>(v.data()), v.size()*sizeof(float));
+}
+
+inline void ensure_out_dir(const char* dir = "out") {
+    std::string cmd = std::string("mkdir -p ") + dir;
+    std::system(cmd.c_str());
 }
