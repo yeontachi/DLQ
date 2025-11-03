@@ -67,7 +67,6 @@ def cosine(a, b, eps=1e-12):
         return 0.0
     return float(ab / (np.sqrt(aa) * np.sqrt(bb)))
 
-# ... import 동일 ...
 from torchvision.models import resnet18, ResNet18_Weights
 
 def main():
@@ -147,8 +146,6 @@ def main():
     print(f"         torch={np.mean(torch_times):.2f} ms, cuda={np.mean(cuda_times):.2f} ms, "
           f"speedup={np.mean(torch_times)/np.mean(cuda_times):.2f}x")
     print(f"         logits_cosine={np.mean(cosines):.4f}")
-
-    # 요약 출력 동일 ...
 
     # 최종 요약
     avg_torch = float(np.mean(torch_times)) if torch_times else 0.0

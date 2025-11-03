@@ -93,66 +93,89 @@ static inline void fc_forward(const float* gap,            // [512]
     // bias add on host
     for (int o=0;o<O;o++) out[o] += B[o];
 }
-// ... 기존 include 동일 ...
+
 static void usage(){
-    std::cout <<
-      "Usage:\n"
-      "  step8_e2e --manifest <dir> "
-      "[--layer4 <l4.bin>] [--gap <gap.bin>] "
-      "[--fc_weight <w.bin>] [--fc_bias <b.bin>]\n";
+  std::cout <<
+    "step8_e2e --manifest <dir> "
+    "[--gap <gap.bin> | --gap_list <list.txt>] "
+    "[--fc_weight <w.bin>] [--fc_bias <b.bin>] "
+    "[--save_logits]\n";
 }
 
-int main(int argc, char** argv)
-{
-    std::string mani, layer4_path, gap_path, fcw_path, fcb_path;
+int main(int argc, char** argv){
+  std::string mani, gap_path, gap_list, fcw_path, fcb_path;
+  bool save_logits=false;
 
-    for (int i=1;i<argc;i++){
-        std::string a = argv[i];
-        if (a=="--manifest"   && i+1<argc) mani = argv[++i];
-        else if (a=="--layer4" && i+1<argc) layer4_path = argv[++i];
-        else if (a=="--gap"    && i+1<argc) gap_path    = argv[++i];  // NEW
-        else if (a=="--fc_weight" && i+1<argc) fcw_path = argv[++i];
-        else if (a=="--fc_bias"   && i+1<argc) fcb_path = argv[++i];
+  for (int i=1;i<argc;i++){
+    std::string a=argv[i];
+    if(a=="--manifest" && i+1<argc) mani=argv[++i];
+    else if(a=="--gap" && i+1<argc) gap_path=argv[++i];
+    else if(a=="--gap_list" && i+1<argc) gap_list=argv[++i];          // NEW
+    else if(a=="--fc_weight" && i+1<argc) fcw_path=argv[++i];
+    else if(a=="--fc_bias"   && i+1<argc) fcb_path=argv[++i];
+    else if(a=="--save_logits") save_logits=true;
+  }
+  if(mani.empty() || (gap_path.empty() && gap_list.empty())){ usage(); return 1; }
+  ensure_out_dir();
+
+  // FC weight/bias 로드
+  auto Wfc = fcw_path.empty()? load_bin_f32(mani + "/fc.weight.bin", 1000*512)
+                             : load_bin_f32(fcw_path,                1000*512);
+  auto Bfc = fcb_path.empty()? load_bin_f32(mani + "/fc.bias.bin",   1000)
+                             : load_bin_f32(fcb_path,                1000);
+
+  // 디바이스 메모리 재사용(FC용)
+  auto dW   = copy_to_device(Wfc);
+  auto dGap = make_device_f32(512);
+  auto dOut = make_device_f32(1000);
+
+  // 타이머(순수 CUDA 커널 시간만)
+  cudaEvent_t evA, evB; CUDA_CHECK(cudaEventCreate(&evA)); CUDA_CHECK(cudaEventCreate(&evB));
+  float total_ms=0.0f; int cnt=0;
+
+  auto run_one = [&](const std::string& gpath){
+    auto gap = load_bin_f32(gpath, 512);
+    CUDA_CHECK(cudaMemcpy(dGap.get(), gap.data(), 512*sizeof(float), cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaEventRecord(evA));
+    // y[1000x1] = W[1000x512] @ x[512x1]
+    {
+      dim3 blk(32,32);
+      dim3 grd( (1+blk.x-1)/blk.x, (1000+blk.y-1)/blk.y );
+      sgemm_tiled<<<grd,blk>>>(dW.get(), dGap.get(), dOut.get(), 1000, 1, 512);
     }
-    if (mani.empty()) { usage(); return 1; }
+    CUDA_CHECK(cudaEventRecord(evB));
+    CUDA_CHECK(cudaEventSynchronize(evB));
+    float ms=0; CUDA_CHECK(cudaEventElapsedTime(&ms, evA, evB));
+    total_ms += ms; cnt++;
 
-    ensure_out_dir();  // utils.hpp에 이미 구현한 mkdir -p 헬퍼
+    auto host = copy_to_host(dOut, 1000);
+    for(int i=0;i<1000;i++) host[i] += Bfc[i];
 
-    // ---- FC 가중치 선택 로드 ----
-    std::vector<float> Wfc = fcw_path.empty() ? load_bin_f32(mani + "/fc.weight.bin", 1000*512)
-                                              : load_bin_f32(fcw_path,                1000*512);
-    std::vector<float> Bfc = fcb_path.empty() ? load_bin_f32(mani + "/fc.bias.bin",   1000)
-                                              : load_bin_f32(fcb_path,                1000);
-
-    // ---- 입력 벡터: gap(512) 우선 사용 ----
-    std::vector<float> gap512;
-    if (!gap_path.empty()) {
-        gap512 = load_bin_f32(gap_path, 512);           // Torch에서 만든 GAP 그대로 사용
-    } else {
-        // fallback: layer4 -> CUDA GAP (이전과 동일)
-        const int C=512, H=7, W=7;
-        std::vector<float> L4 = layer4_path.empty()
-          ? load_bin_f32(mani + "/fixtures_step8/layer4_out.bin", C*H*W)
-          : load_bin_f32(layer4_path, C*H*W);
-
-        auto dL4  = copy_to_device(L4);
-        auto dGAP = make_device_f32(C);
-        dim3 blk(256), grd(div_up(C, (int)blk.x));
-        gap_global<<<grd, blk>>>(dL4.get(), C, H, W, dGAP.get());
-        CUDA_CHECK(cudaDeviceSynchronize());
-        gap512 = copy_to_host(dGAP, C);
+    if(save_logits){
+      char fn[256]; std::snprintf(fn, sizeof(fn), "out/step8_logits_%06d.bin", cnt);
+      save_bin_f32_local(fn, host);
     }
-
-    // ---- FC만 수행 ----
-    std::vector<float> logits;
-    fc_forward(gap512.data(), Wfc, Bfc, logits);      // y[1000] = W[1000x512] @ x[512] + b
-
-    save_bin_f32_local("out/step8_logits.bin", logits);
-
-    // top-1
     int top=-1; float best=-1e30f;
-    for (int i=0;i<1000;i++) if (logits[i] > best){ best=logits[i]; top=i; }
-    std::cout<<"[E2E] top-1 class index = "<<top<<", logit="<<best<<"\n";
-    std::cout<<"(주의: synset 매핑은 별도)\n";
-    return 0;
+    for(int i=0;i<1000;i++) if(host[i]>best){ best=host[i]; top=i; }
+    // (원하면 per-sample 로그 출력)
+    // std::cout<<"top1="<<top<<" logit="<<best<<"\n";
+  };
+
+  if(!gap_list.empty()){
+    std::ifstream ifs(gap_list);
+    if(!ifs){ std::cerr<<"open fail: "<<gap_list<<"\n"; return 2; }
+    std::string line;
+    while(std::getline(ifs, line)){
+      if(line.empty()) continue;
+      run_one(line);
+    }
+  } else {
+    run_one(gap_path);
+  }
+
+  if(cnt>0) std::cout<<"[CUDA] avg FC time: "<<(total_ms/cnt)<<" ms over "<<cnt<<" samples\n";
+
+  CUDA_CHECK(cudaEventDestroy(evA)); CUDA_CHECK(cudaEventDestroy(evB));
+  return 0;
 }

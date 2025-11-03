@@ -30,3 +30,7 @@ Thumbs.db
 logs/
 
 imagenet_val/
+
+out/
+tmp_e2e/
+tmp_gaps/
