@@ -2,24 +2,17 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="$ROOT/build/fp32/step8_e2e"
 MANI="$ROOT/exports/resnet18/fp32"
-IMDIR="$ROOT/data/imagenet_val/ILSVRC2012_img_val"   
-PY="$ROOT/tools/bench_fp32_vs_torch.py"
+BIN="$ROOT/build/fp32/step8_e2e"
+IMDIR="$ROOT/data/imagenet_val/ILSVRC2012_img_val"
+LIMIT="${LIMIT:-500}"
 
-if [[ ! -x "$BIN" ]]; then
-  echo "Error: $BIN not found. Build first: bash scripts/build_fp32.sh"
-  exit 1
-fi
+echo "[INFO] images=$LIMIT under $IMDIR"
 
-source "$ROOT/venv/bin/activate" 2>/dev/null || true
-
-python "$PY" \
+# 1) Torch로 GAP 덤프 + CUDA FC 실행까지 한 번에 (fast 버전)
+python "$ROOT/tools/bench_fp32_vs_torch_fast.py" \
   --manifest "$MANI" \
   --bin "$BIN" \
   --imagenet_dir "$IMDIR" \
-  --limit 500 \
-  --warmup 5 \
-  --iters 20 \
-  --shuffle \
-  --save_log
+  --limit "$LIMIT" \
+  --save_logits
