@@ -67,6 +67,7 @@ def cosine(a, b, eps=1e-12):
         return 0.0
     return float(ab / (np.sqrt(aa) * np.sqrt(bb)))
 
+# ... import 동일 ...
 from torchvision.models import resnet18, ResNet18_Weights
 
 def main():
