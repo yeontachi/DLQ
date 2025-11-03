@@ -111,3 +111,19 @@ add_executable(step8_e2e
 target_include_directories(step8_e2e PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 target_link_libraries(step8_e2e PRIVATE CUDA::cudart)
 set_target_properties(step8_e2e PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+set(FC_LIB_SRCS
+    ${CMAKE_CURRENT_SOURCE_DIR}/kernels/transpose.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/kernels/add_bias.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime/fc_api.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/kernels/sgemm_tiled.cu  # 기존 GEMM 재사용
+)
+
+add_library(fc SHARED ${FC_LIB_SRCS})
+target_include_directories(fc PRIVATE ${CUDA_TOOLKIT_INCLUDE})
+target_link_libraries(fc PRIVATE cuda cudart)
+
+# 출력 경로 통일
+set_target_properties(fc PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/fp32
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/fp32)
