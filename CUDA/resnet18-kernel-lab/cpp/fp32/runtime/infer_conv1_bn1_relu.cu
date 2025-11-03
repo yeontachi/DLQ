@@ -113,6 +113,10 @@ int main(int argc, char** argv){
     CUDA_CHECK(cudaDeviceSynchronize());
     ms_bn = T.stop();
 
+    std::vector<float> y_bn(cfg.OC*cfg.OH*cfg.OW);
+    CUDA_CHECK(cudaMemcpy(y_bn.data(), dY, y_bn.size()*4, cudaMemcpyDeviceToHost));
+    save_bin_f32("out/step2_bn1_cuda.bin", y_bn);
+    
     // ReLU
     T.start();
     relu_forward<<< (cfg.OC*cfg.OH*cfg.OW +255)/256, 256 >>>(dY, cfg.OC*cfg.OH*cfg.OW);

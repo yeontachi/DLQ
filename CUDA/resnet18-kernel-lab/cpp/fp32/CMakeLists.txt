@@ -106,6 +106,7 @@ add_executable(step8_e2e
     kernels/relu.cu
     kernels/add.cu
     kernels/gap_global.cu    
+    kernels/maxpool2d.cu
 )
 
 target_include_directories(step8_e2e PRIVATE ${CUDAToolkit_INCLUDE_DIRS})

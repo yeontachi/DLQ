@@ -1,28 +1,41 @@
-#include <cuda_runtime.h>
+#include <float.h>
+#include "maxpool2d.cuh"
+
 extern "C" __global__
-void maxpool2d_nchw(const float* __restrict__ x, // [C,H,W], N=1
-                    int C,int H,int W,
-                    int kH,int kW,int sH,int sW,int pH,int pW,
-                    float* __restrict__ y)       // [C,OH,OW]
+void maxpool2d_3x3_s2p1_nchw(const float* __restrict__ x,
+                             int N, int C, int H, int W,
+                             float* __restrict__ y)
 {
-    int OH = (H + 2*pH - kH)/sH + 1;
-    int OW = (W + 2*pW - kW)/sW + 1;
+    // grid: (oh*ow, C, N), block: (1,1,1)
+    int nc = blockIdx.y;   // channel
+    int n  = blockIdx.z;   // batch
+    int ohow = blockIdx.x; // packed (oh,ow)
 
-    int c  = blockIdx.z;
-    int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int ow = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c>=C || oh>=OH || ow>=OW) return;
+    int OH = (H + 2*1 - 3)/2 + 1; // p=1, k=3, s=2
+    int OW = (W + 2*1 - 3)/2 + 1;
 
-    float m = -1e30f;
-    for (int kh=0; kh<kH; ++kh){
-        int ih = oh*sH - pH + kh;
-        if (ih<0 || ih>=H) continue;
-        for (int kw=0; kw<kW; ++kw){
-            int iw = ow*sW - pW + kw;
-            if (iw<0 || iw>=W) continue;
-            float v = x[c*H*W + ih*W + iw];
-            m = (v>m)? v : m;
+    int oh = ohow / OW;
+    int ow = ohow % OW;
+
+    const float* xnc = x + ((n*C + nc) * H * W);
+    float* ync      = y + ((n*C + nc) * OH * OW);
+    float vmax = -FLT_MAX;
+
+    // 창의 좌측상단 입력 좌표 (패딩 포함)
+    int ih0 = oh * 2 - 1;
+    int iw0 = ow * 2 - 1;
+
+    #pragma unroll
+    for (int kh=0; kh<3; ++kh){
+        int ih = ih0 + kh;
+        if (ih < 0 || ih >= H) continue;
+        #pragma unroll
+        for (int kw=0; kw<3; ++kw){
+            int iw = iw0 + kw;
+            if (iw < 0 || iw >= W) continue;
+            float v = xnc[ih*W + iw];
+            vmax = v > vmax ? v : vmax;
         }
     }
-    y[c*OH*OW + oh*OW + ow] = m;
+    ync[oh*OW + ow] = vmax;
 }

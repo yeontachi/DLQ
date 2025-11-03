@@ -1,5 +1,5 @@
 #pragma once
-// utils.hpp (final, de-duplicated)
+// utils.hpp (clean single-source version)
 
 #include <vector>
 #include <string>
@@ -11,6 +11,7 @@
 #include <utility>   // std::pair
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 
 #include <cuda_runtime.h>
 
@@ -30,15 +31,18 @@ inline void __cuda_check(cudaError_t e, const char* f, int l){
 #define CUDA_CHECK(expr) __cuda_check((expr), __FILE__, __LINE__)
 #endif
 
+#ifndef CUDA_LAUNCH
 #define CUDA_LAUNCH(kernel, grid, block, ...) \
 do { \
   kernel<<<(grid), (block)>>>(__VA_ARGS__); \
   cudaError_t __e = cudaGetLastError(); \
   if (__e != cudaSuccess){ \
-    fprintf(stderr, "CUDA launch error %s @ %s:%d\n", cudaGetErrorString(__e), __FILE__, __LINE__); \
+    fprintf(stderr, "CUDA launch error %s @ %s:%d\n", \
+            cudaGetErrorString(__e), __FILE__, __LINE__); \
     return 3; \
   } \
 } while(0)
+#endif
 
 // -------------------- binary IO --------------------
 inline std::vector<float> load_bin_f32(const std::string& path, size_t expected = 0){
@@ -55,7 +59,19 @@ inline std::vector<float> load_bin_f32(const std::string& path, size_t expected 
     return v;
 }
 
-// -------------------- extern CUDA kernels --------------------
+inline void save_bin_f32(const std::string& path, const std::vector<float>& v) {
+    std::ofstream ofs(path, std::ios::binary);
+    if (!ofs) { std::cerr << "open fail (write): " << path << "\n"; std::exit(1); }
+    if (!v.empty())
+        ofs.write(reinterpret_cast<const char*>(v.data()), v.size()*sizeof(float));
+}
+
+inline void ensure_out_dir(const char* dir = "out") {
+    std::string cmd = std::string("mkdir -p ") + dir;
+    std::system(cmd.c_str());
+}
+
+// -------------------- extern CUDA kernels (prototypes) --------------------
 extern "C" __global__
 void im2col_nchw(const float*,int,int,int,int,int,int,int,int,int,int,float*);
 extern "C" __global__
@@ -75,7 +91,7 @@ struct Timer {
                   float ms=0; CUDA_CHECK(cudaEventElapsedTime(&ms,a,b)); return ms; }
 };
 
-// -------------------- simple wrappers (for Step2/compat) --------------------
+// -------------------- simple wrappers (Step2/compat) --------------------
 struct CmdArgs { std::string manifest; };
 inline CmdArgs parse_args(int argc, char** argv) {
     CmdArgs a;
@@ -97,7 +113,6 @@ inline Tensor load_bin(const std::string& path, size_t n_elems) {
 struct Manifest {
     std::string root;
     explicit Manifest(std::string r): root(std::move(r)){}
-    // 주의: 실제 manifest.json 파싱은 안 함. 호출부에서 개수를 제공해야 함.
     Tensor load(const std::string& name, size_t n_elems) {
         return load_bin(root + "/" + name + ".bin", n_elems);
     }
@@ -109,21 +124,30 @@ struct DeviceDeleter {
         if (p) cudaFree(p);
     }
 };
+
 using DevicePtr = std::unique_ptr<float, DeviceDeleter>;
 
 // allocate device float[n] and return unique_ptr
 inline DevicePtr make_device_f32(size_t n_elems) {
-    float* p = nullptr;
     if (n_elems == 0) return DevicePtr(nullptr);
+    float* p = nullptr;
     CUDA_CHECK(cudaMalloc(&p, n_elems * sizeof(float)));
     return DevicePtr(p);
 }
 
-// host -> device (unique_ptr)
+// host -> device (vector)
 inline DevicePtr copy_to_device(const std::vector<float>& host) {
     DevicePtr d = make_device_f32(host.size());
     if (!host.empty())
         CUDA_CHECK(cudaMemcpy(d.get(), host.data(), host.size()*sizeof(float), cudaMemcpyHostToDevice));
+    return d;
+}
+
+// host -> device (raw ptr, count)
+inline DevicePtr copy_to_device(const float* src, size_t n_elems) {
+    DevicePtr d = make_device_f32(n_elems);
+    if (n_elems && src)
+        CUDA_CHECK(cudaMemcpy(d.get(), src, n_elems*sizeof(float), cudaMemcpyHostToDevice));
     return d;
 }
 
@@ -150,23 +174,4 @@ diff_max_mean(const std::vector<float>& a, const std::vector<float>& b)
     }
     if (n) mean_abs /= (double)n;
     return {max_abs, mean_abs};
-}
-// utils.hpp 하단(기존 copy_to_device(vector<>) 아래)에 추가
-inline std::unique_ptr<float, DeviceDeleter>
-copy_to_device(const float* src, size_t n_elems)
-{
-    float* d = nullptr;
-    size_t bytes = n_elems * sizeof(float);
-    CUDA_CHECK(cudaMalloc(&d, bytes));
-    if (n_elems > 0 && src) {
-        CUDA_CHECK(cudaMemcpy(d, src, bytes, cudaMemcpyHostToDevice));
-    }
-    return std::unique_ptr<float, DeviceDeleter>(d);
-}
-
-// utils.hpp 하단 어딘가
-inline void save_bin_f32(const std::string& path, const std::vector<float>& v) {
-    std::ofstream ofs(path, std::ios::binary);
-    if (!ofs) { std::cerr << "open fail (write): " << path << "\n"; std::exit(1); }
-    ofs.write(reinterpret_cast<const char*>(v.data()), v.size()*sizeof(float));
 }
