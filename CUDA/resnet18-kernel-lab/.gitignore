@@ -28,3 +28,5 @@ Thumbs.db
 
 # logs
 logs/
+
+imagenet_val/
