@@ -1,38 +1,41 @@
-#include <cuda_runtime.h>
+#include <float.h>
 #include "maxpool2d.cuh"
-
-__device__ inline float neg_inf() { return -1e30f; }
 
 extern "C" __global__
 void maxpool2d_3x3_s2p1_nchw(const float* __restrict__ x,
                              int N, int C, int H, int W,
                              float* __restrict__ y)
 {
-    // PyTorch stem maxpool: k=3, s=2, p=1 (floor)
-    const int OH = (H + 2*1 - 3)/2 + 1;
-    const int OW = (W + 2*1 - 3)/2 + 1;
+    // grid: (oh*ow, C, N), block: (1,1,1)
+    int nc = blockIdx.y;   // channel
+    int n  = blockIdx.z;   // batch
+    int ohow = blockIdx.x; // packed (oh,ow)
 
-    int n = blockIdx.z;
-    int c = blockIdx.y;
-    int oh = blockIdx.x / OW;
-    int ow = blockIdx.x % OW;
+    int OH = (H + 2*1 - 3)/2 + 1; // p=1, k=3, s=2
+    int OW = (W + 2*1 - 3)/2 + 1;
 
-    int ih_center = oh*2 - 1 + 1; // s*oh - p + offset
-    int iw_center = ow*2 - 1 + 1;
+    int oh = ohow / OW;
+    int ow = ohow % OW;
 
-    float m = neg_inf();
+    const float* xnc = x + ((n*C + nc) * H * W);
+    float* ync      = y + ((n*C + nc) * OH * OW);
+    float vmax = -FLT_MAX;
+
+    // 창의 좌측상단 입력 좌표 (패딩 포함)
+    int ih0 = oh * 2 - 1;
+    int iw0 = ow * 2 - 1;
+
+    #pragma unroll
     for (int kh=0; kh<3; ++kh){
+        int ih = ih0 + kh;
+        if (ih < 0 || ih >= H) continue;
+        #pragma unroll
         for (int kw=0; kw<3; ++kw){
-            int ih = ih_center + kh;
-            int iw = iw_center + kw;
-            float v = neg_inf();
-            if (0<=ih && ih<H && 0<=iw && iw<W){
-                int idx = ((n*C + c)*H + ih)*W + iw;
-                v = x[idx];
-            }
-            m = fmaxf(m, v);
+            int iw = iw0 + kw;
+            if (iw < 0 || iw >= W) continue;
+            float v = xnc[ih*W + iw];
+            vmax = v > vmax ? v : vmax;
         }
     }
-    int oidx = ((n*C + c)*OH + oh)*OW + ow;
-    y[oidx] = m;
+    ync[oh*OW + ow] = vmax;
 }

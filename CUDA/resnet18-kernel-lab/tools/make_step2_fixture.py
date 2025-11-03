@@ -1,33 +1,52 @@
 # tools/make_step2_fixture.py
-import os, argparse, torch, numpy as np
+import os, numpy as np, torch
+from PIL import Image
+from torchvision import transforms as T
 from torchvision.models import resnet18, ResNet18_Weights
 
-def main(manifest_dir):
-    out_dir = os.path.join(manifest_dir, "fixtures")
-    os.makedirs(out_dir, exist_ok=True)
+HERE = os.path.dirname(__file__)
+ROOT = os.path.abspath(os.path.join(HERE, ".."))
+MANI = os.path.join(ROOT, "exports/resnet18/fp32")
+os.makedirs(os.path.join(MANI, "fixtures"), exist_ok=True)
 
-    # 1) 모델과 가중치
-    m = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1).eval().float()
-    sd = m.state_dict()
+# 1) 전처리 파이프라인: 가급적 weights.transforms() 사용
+try:
+    weights = ResNet18_Weights.IMAGENET1K_V1
+    preprocess = weights.transforms()   # Resize(256)→CenterCrop(224)→ToTensor→Normalize
+except Exception:
+    # 혹시 매우 구버전이면 명시 상수로 대체
+    mean = (0.485, 0.456, 0.406)
+    std  = (0.229, 0.224, 0.225)
+    preprocess = T.Compose([
+        T.Resize(256, interpolation=T.InterpolationMode.BILINEAR),
+        T.CenterCrop(224),
+        T.ToTensor(),
+        T.Normalize(mean=mean, std=std),
+    ])
+    weights = ResNet18_Weights.IMAGENET1K_V1  # 모델 로딩용
 
-    # 2) 입력 텐서: 고정 시드로 재현성 있는 난수 입력 (1,3,224,224)
-    torch.manual_seed(0)
-    x = torch.randn(1, 3, 224, 224, dtype=torch.float32)
+# 2) 입력 이미지 준비
+img_path = os.path.join(ROOT, "data", "sample.jpg")
+if not os.path.exists(img_path):
+    Image.new("RGB", (256, 256), (128, 128, 128)).save(img_path)  # 없으면 회색 더미 생성
+img = Image.open(img_path).convert("RGB")
 
-    with torch.no_grad():
-        y = m.relu(m.bn1(m.conv1(x)))  # conv1 -> bn1 -> relu
+# 3) input.bin 저장 (NCHW float32)
+x = preprocess(img).unsqueeze(0).float()  # [1,3,224,224]
+x.cpu().numpy().astype("float32").tofile(os.path.join(MANI, "fixtures", "input.bin"))
 
-    # 3) 저장
-    x.cpu().numpy().tofile(os.path.join(out_dir, "input.bin"))
-    y.cpu().numpy().tofile(os.path.join(out_dir, "expected.bin"))
+# 4) Torch 모델 로드
+m = resnet18(weights=weights).eval().float()
 
-    # 4) conv1/bn1 가중치도 이 디렉토리서 참조하므로, Step1에서 이미 export된 파일을 그대로 사용
-    print("fixture saved:")
-    print(" ", os.path.join(out_dir, "input.bin"))
-    print(" ", os.path.join(out_dir, "expected.bin"))
+# 5) conv1 / bn1 / relu 출력 각각 저장
+with torch.no_grad():
+    y_conv1 = m.conv1(x)                                  # [1,64,112,112]
+    y_conv1.cpu().numpy().astype("float32").tofile(os.path.join(MANI, "fixtures", "step2_conv1.bin"))
 
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--manifest", required=True, help="exports/resnet18/fp32")
-    args = ap.parse_args()
-    main(args.manifest)
+    y_bn1 = m.bn1(y_conv1)                                # BN (eps=1e-5, running_var)
+    y_bn1.cpu().numpy().astype("float32").tofile(os.path.join(MANI, "fixtures", "step2_bn1.bin"))
+
+    y_relu = torch.relu(y_bn1)                            # 최종 expected
+    y_relu.cpu().numpy().astype("float32").tofile(os.path.join(MANI, "fixtures", "expected.bin"))
+
+print("Wrote fixtures: input.bin, step2_conv1.bin, step2_bn1.bin, expected.bin")
